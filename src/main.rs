@@ -136,7 +136,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [encoder_time_diff], priority = 2)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [encoder_time_diff], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -158,23 +158,39 @@ mod app {
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, shared = [usb_dev, serial], priority = 2)]
-    fn usb_interrupt(mut ctx: usb_interrupt::Context) {
+    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial], priority = 2)]
+    fn usb_interrupt(ctx: usb_interrupt::Context) {
         let usb_dev = ctx.shared.usb_dev;
         let serial = ctx.shared.serial;
 
+        let buff = ctx.local.buff;
+        let buff_len = ctx.local.buff_len;
+
+        // read data from usb serial and store it in the local buffer. The buffer length is stored in a local variable as well.
         (usb_dev, serial).lock(|usb_dev, serial| {
             if !usb_dev.poll(&mut [serial]) {
                 return;
             }
 
-            let mut buf = [0u8; 64];
-            if let Ok(count) = serial.read(&mut buf)
-                && count > 0
-            {
-                let _ = serial.write(&buf[..count]);
+            while let Ok(count) = serial.read(&mut buff[*buff_len..]) {
+                *buff_len += count;
             }
         });
+
+        if buff[*buff_len - 1] == b'\n' {
+            // if the last byte in the buffer is a newline, then we consider this a complete command and print it out, then reset the buffer length to 0.
+            let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");
+            info!("Received command: {}", command);
+            *buff_len = 0;
+
+            if let Some(rest) = command.strip_prefix("pwm-a ") {
+                info!("Setting PWM A to {}", rest);
+                // todo:
+            } else if let Some(rest) = command.strip_prefix("pwm-b ") {
+                info!("Setting PWM B to {}", rest);
+                // todo:
+            }
+        }
     }
 }
 

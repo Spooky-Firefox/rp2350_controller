@@ -240,6 +240,35 @@ Why this helps in embedded code:
 - Makes intent clearer (`hal::gpio::Pins` is easier to scan)
 - Reduces typo risk when repeating deep module paths
 
+### Attributes (`#[...]`)
+
+Attributes are metadata attached to items (functions, modules, constants). They tell the compiler or frameworks how to treat that item.
+
+```rust
+#[task(binds = IO_IRQ_BANK0, priority = 3)]
+fn gpio_interrupt(...) { ... }
+```
+
+In this project, `#[task(...)]` is an RTIC attribute. It registers the function as a real-time task and configures things like:
+
+- which interrupt triggers it (`binds = ...`)
+- priority level (`priority = ...`)
+- local/shared resources the task is allowed to access
+
+Without this attribute, the function is just a normal Rust function and RTIC will not schedule it.
+
+```rust
+#[allow(unsafe_code)]
+```
+
+This attribute relaxes a lint rule for the next item (or module/crate scope, depending where it is written). It means: "unsafe code is allowed here." In this codebase, it is used for a few low-level hardware setup parts where `unsafe` is unavoidable.
+
+Why this is useful:
+
+- keeps most of the code strictly safe
+- marks exactly where special low-level operations happen
+- makes code review easier because the risky areas are explicit
+
 ### `const` — compile-time constants
 
 ```rust

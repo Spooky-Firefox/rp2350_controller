@@ -101,6 +101,132 @@ The compiler *enforces* that you lock before accessing — you cannot forget, un
 
 ---
 
+## Rust Syntax Cheat-Sheet
+
+You don't need to write Rust, but being able to *read* it helps. Here are the constructs you'll encounter in this codebase.
+
+### Variables
+
+```rust
+let x = 5;           // immutable — like a MATLAB constant, cannot be reassigned
+let mut y = 5;       // mutable   — like a normal Python variable
+y = y + 1;           // OK because y is mut
+```
+
+Rust requires you to explicitly opt-in to mutability with `mut`. This prevents accidental modification — a common bug source.
+
+### Types
+
+Rust types are written after a colon. You'll often see type aliases at the top of `main.rs` that give long hardware types a short name:
+
+```rust
+type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
+```
+
+This just means "call this complicated type `LedPin` from now on". It's like a shorthand.
+
+Integer sizes are explicit: `u32` = unsigned 32-bit integer, `i32` = signed 32-bit, `f32` = 32-bit float (like `single` in MATLAB), `usize` = pointer-sized unsigned integer (used for array indices).
+
+### Functions
+
+```rust
+fn add(a: f32, b: f32) -> f32 {
+    a + b          // no semicolon = this is the return value
+}
+```
+
+In Python this would be `def add(a, b): return a + b`. The last expression in a block without a `;` is automatically returned.
+
+### Closures (anonymous functions / lambdas)
+
+Closures are the `|variable| expression` syntax you'll see throughout the code:
+
+```rust
+ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
+```
+
+The `|diff|` part is like Python's `lambda diff:` — it defines an anonymous function that receives `diff` as an argument. This particular line means: *"acquire the lock, then run this small function with the protected value"*.
+
+Another example with a longer body:
+
+```rust
+(usb_dev, serial).lock(|usb_dev, serial| {
+    // code that uses usb_dev and serial safely
+});
+```
+
+Compare to Python: `lock(lambda usb_dev, serial: ...)` — same idea, different spelling.
+
+### `Option` — values that might not exist
+
+Rust has no `None` confusion like Python. Instead of any variable silently being `None`, you must explicitly handle the possibility:
+
+```rust
+// Option<u32> means "either Some(number) or None"
+fn parse_on_time_us(arg: &str) -> Option<u32> { ... }
+
+// Using it — must handle both cases:
+if let Some(on_time_us) = parse_on_time_us(rest) {
+    // on_time_us is a real u32 here
+} else {
+    // nothing was parsed
+}
+```
+
+`.unwrap()` means "I'm certain this is `Some`, give me the value — crash if I'm wrong". Used where failure is truly impossible.
+
+### `Result` — operations that can fail
+
+```rust
+let clocks = init_clocks_and_plls(...).unwrap();
+```
+
+`Result<T, E>` is either `Ok(value)` or `Err(error)` — like a function that either succeeds or returns an error. `.unwrap()` takes the success value or panics. In production code you'd handle the error; here `.unwrap()` is acceptable because a clock initialisation failure means the hardware is broken.
+
+### References and `*` (dereferencing)
+
+The `&` prefix means "a reference to" (a pointer, not a copy). The `*` prefix means "follow the reference to get the actual value":
+
+```rust
+ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
+//                                         ^ write through the reference
+```
+
+Think of `diff` as a pointer in C, or a MATLAB `handle` object — `*diff` reaches the value it points to.
+
+### Macros — the `!` suffix
+
+Any call ending in `!` is a macro (code that generates code at compile time), not a regular function:
+
+```rust
+info!("encoder speed : {} m/s", value);  // like Python's print(f"encoder speed: {value} m/s")
+unwrap!();
+```
+
+`info!` and `trace!` are from the `defmt` library — they send formatted strings over the debug probe (not USB serial).
+
+### `const` — compile-time constants
+
+```rust
+const SYS_CLOCK_HZ: u32 = 125_000_000;  // like MATLAB's global constants
+```
+
+Underscores in numbers are just visual separators (like a thousands comma): `125_000_000` = 125000000.
+
+### `loop` and `-> !`
+
+```rust
+async fn toggle_led(...) -> ! {
+    loop {
+        // runs forever
+    }
+}
+```
+
+`-> !` means "this function never returns" (the `!` type is called "never"). All tasks run in infinite loops — on a microcontroller, returning from main would be meaningless.
+
+---
+
 ## File Overview
 
 | File | Purpose |

@@ -125,7 +125,24 @@ type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::Pull
 
 This just means "call this complicated type `LedPin` from now on". It's like a shorthand.
 
+In embedded programming, these detailed types are very important because they encode hardware constraints at compile time. Instead of trusting comments, the type system ensures you cannot accidentally use a pin in the wrong mode.
+
+Short breakdown of the long type:
+
+- `gpio::Pin<...>`: a GPIO pin object
+- `gpio::bank0::Gpio25`: the physical pin number (GPIO 25)
+- `gpio::FunctionSioOutput`: pin function is digital output mode
+- `gpio::PullDown`: internal pull-down resistor configuration
+
+So the type says: "this is exactly GPIO25, configured as a digital output, with pull-down." If code expects an output pin, passing an input pin type will fail at compile time.
+
 Integer sizes are explicit: `u32` = unsigned 32-bit integer, `i32` = signed 32-bit, `f32` = 32-bit float (like `single` in MATLAB), `usize` = pointer-sized unsigned integer (used for array indices).
+
+Why explicit sizes matter on microcontrollers:
+
+- Memory is small, so `u8`/`u16`/`u32` choices affect RAM use
+- Registers are fixed-width hardware fields, so matching bit-width avoids bugs
+- Timing/math code should use predictable types so behavior is deterministic
 
 ### Functions
 
@@ -204,6 +221,24 @@ unwrap!();
 ```
 
 `info!` and `trace!` are from the `defmt` library — they send formatted strings over the debug probe (not USB serial).
+
+### Imports and `use`
+
+Rust uses `use` to bring names into scope, similar to Python imports.
+
+```rust
+use rp235x_hal as hal;
+use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
+```
+
+- `use rp235x_hal as hal;`: import the crate with a short alias (`hal`)
+- `use ...::{A, B};`: import multiple items from one module
+
+Why this helps in embedded code:
+
+- Keeps long hardware paths readable
+- Makes intent clearer (`hal::gpio::Pins` is easier to scan)
+- Reduces typo risk when repeating deep module paths
 
 ### `const` — compile-time constants
 

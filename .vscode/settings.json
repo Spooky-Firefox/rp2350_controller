@@ -6,10 +6,15 @@
     "thumbv8m.main-none-eabihf"
   ],
   "cSpell.words": [
+    "bootrom",
     "CPACR",
     "defmt",
+    "DPRAM",
+    "monotonics",
     "plls",
     "rtic",
+    "USBCTRL",
+    "usbd",
     "XTAL"
   ],
 }

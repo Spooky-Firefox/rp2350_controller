@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
+#![deny(unsafe_code)]
 
 use core::f32::consts::PI;
 
 use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
-use fugit::ExtU64;
+use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32, TimerDurationU64};
+use hal::gpio;
 use panic_probe as _;
 use rp235x_hal as hal;
 use rp235x_pac as pac;
@@ -15,32 +17,46 @@ use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
 use usbd_serial::SerialPort;
 
 /// Required by the RP2350 bootrom to identify and validate the image.
+#[allow(unsafe_code)]
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
+
 const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 
-type LedPin =
-    hal::gpio::Pin<hal::gpio::bank0::Gpio25, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>;
+const SYS_CLOCK_HZ: u32 = 125_000_000;
+const PWM_DIV_INT: u8 = 64;
+const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / PWM_DIV_INT as u32;
 
-type EncoderPin =
-    hal::gpio::Pin<hal::gpio::bank0::Gpio13, hal::gpio::FunctionSioInput, hal::gpio::PullUp>;
+const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);
+const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_500);
+
+type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
+
+type EncoderPin = gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
+
+type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm7, hal::pwm::FreeRunning>;
+
+type MotorPwmPinA = gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionPwm, gpio::PullDown>;
+
+type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionPwm, gpio::PullDown>;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0])]
 mod app {
 
     use cortex_m::asm::delay;
     use defmt::{info, trace};
-    use rp235x_pac::usb;
+    use embedded_hal::pwm::SetDutyCycle;
+    use fugit::{MicrosDurationU32, TimerInstantU64};
     use rtic_monotonics::Monotonic;
 
     use super::*;
 
     #[shared]
     struct Shared {
-        encoder_time_diff: fugit::Duration<u64, 1, 1_000_000>,
+        encoder_time_diff: TimerDurationU64<1_000_000>,
         usb_dev: UsbDevice<'static, MyUsbBus>,
         serial: SerialPort<'static, MyUsbBus>,
     }
@@ -48,8 +64,11 @@ mod app {
     #[local]
     struct Local {
         encoder: EncoderPin,
-        encoder_last_time: fugit::Instant<u64, 1, 1_000_000>,
+        encoder_last_time: TimerInstantU64<1_000_000>,
         led: LedPin,
+        pwm: MotorPwmSlice,
+        _pwm_a_pin: MotorPwmPinA,
+        _pwm_b_pin: MotorPwmPinB,
     }
 
     rtic_monotonics::rp235x_timer_monotonic!(MainMono);
@@ -57,7 +76,10 @@ mod app {
     #[init(local = [usb_bus: Option<UsbBusAllocator<MyUsbBus>> = None])]
     fn init(ctx: init::Context) -> (Shared, Local) {
         // do init stuff that are in hal::entry but left out when using rtic which uses the cortex-m-rt entry point.
-        unsafe { entry() };
+        #[allow(unsafe_code)]
+        unsafe {
+            entry()
+        };
 
         // Grab our singleton objects
         let mut pac = ctx.device;
@@ -92,6 +114,23 @@ mod app {
 
         let onboard_led = pins.gpio25.into_push_pull_output();
 
+        let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+        let mut pwm = pwm_slices.pwm7;
+        pwm.set_div_int(PWM_DIV_INT);
+        let period_ticks: fugit::TimerDurationU32<PWM_TIMER_HZ> = PWM_PERIOD.convert();
+        pwm.set_top(period_ticks.ticks().saturating_sub(1) as u16);
+        pwm.enable();
+        let pwm_a_pin = pwm.channel_a.output_to(pins.gpio14);
+        let pwm_b_pin = pwm.channel_b.output_to(pins.gpio15);
+        let _ = pwm
+            .channel_a
+            .set_duty_cycle(micros_to_pwm_ticks(PWM_DEFAULT_ON_TIME));
+        let _ = pwm
+            .channel_b
+            .set_duty_cycle(micros_to_pwm_ticks(PWM_DEFAULT_ON_TIME));
+        pwm.channel_a.set_enabled(true);
+        pwm.channel_b.set_enabled(true);
+
         toggle_led::spawn().unwrap();
 
         let encoder = pins.gpio13.into_pull_up_input();
@@ -100,14 +139,17 @@ mod app {
         MainMono::start(pac.TIMER0, &pac.RESETS);
         (
             Shared {
-                encoder_time_diff: fugit::Duration::<u64, 1, 1_000_000>::from_ticks(0),
+                encoder_time_diff: TimerDurationU64::<1_000_000>::from_ticks(0),
                 usb_dev,
                 serial,
             },
             Local {
                 led: onboard_led,
                 encoder,
-                encoder_last_time: fugit::Instant::<u64, 1, 1000000>::from_ticks(0),
+                encoder_last_time: TimerInstantU64::<1_000_000>::from_ticks(0),
+                pwm,
+                _pwm_a_pin: pwm_a_pin,
+                _pwm_b_pin: pwm_b_pin,
             },
         )
     }
@@ -158,7 +200,7 @@ mod app {
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial], priority = 2)]
+    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0, pwm], shared = [usb_dev, serial], priority = 2)]
     fn usb_interrupt(ctx: usb_interrupt::Context) {
         let usb_dev = ctx.shared.usb_dev;
         let serial = ctx.shared.serial;
@@ -172,29 +214,71 @@ mod app {
                 return;
             }
 
-            while let Ok(count) = serial.read(&mut buff[*buff_len..]) {
+            while *buff_len < buff.len() {
+                let Ok(count) = serial.read(&mut buff[*buff_len..]) else {
+                    break;
+                };
+                if count == 0 {
+                    break;
+                }
                 *buff_len += count;
             }
         });
 
-        if buff[*buff_len - 1] == b'\n' {
+        if *buff_len == buff.len() {
+            info!("USB command too long, dropping buffer");
+            *buff_len = 0;
+            return;
+        }
+
+        if *buff_len > 0 && buff[*buff_len - 1] == b'\n' {
             // if the last byte in the buffer is a newline, then we consider this a complete command and print it out, then reset the buffer length to 0.
             let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");
+            let command = command.trim();
             info!("Received command: {}", command);
             *buff_len = 0;
 
             if let Some(rest) = command.strip_prefix("pwm-a ") {
-                info!("Setting PWM A to {}", rest);
-                // todo:
+                if let Some(on_time_us) = parse_on_time_us(rest) {
+                    let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
+                    let ticks = micros_to_pwm_ticks(on_time);
+                    let _ = ctx.local.pwm.channel_a.set_duty_cycle(ticks);
+                    info!(
+                        "Set PWM A on-time to {} us ({} ticks)",
+                        on_time.ticks(),
+                        ticks
+                    );
+                } else {
+                    info!("Invalid pwm-a value: {}", rest);
+                }
             } else if let Some(rest) = command.strip_prefix("pwm-b ") {
-                info!("Setting PWM B to {}", rest);
-                // todo:
+                if let Some(on_time_us) = parse_on_time_us(rest) {
+                    let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
+                    let ticks = micros_to_pwm_ticks(on_time);
+                    let _ = ctx.local.pwm.channel_b.set_duty_cycle(ticks);
+                    info!(
+                        "Set PWM B on-time to {} us ({} ticks)",
+                        on_time.ticks(),
+                        ticks
+                    );
+                } else {
+                    info!("Invalid pwm-b value: {}", rest);
+                }
             }
         }
     }
 }
 
-fn calculate_speed(magnet_speed: fugit::Duration<u64, 1, 1_000_000>) -> f32 {
+fn parse_on_time_us(arg: &str) -> Option<u32> {
+    arg.trim().parse::<u32>().ok()
+}
+
+fn micros_to_pwm_ticks(on_time: MicrosDurationU32) -> u16 {
+    let pwm_ticks: TimerDurationU32<PWM_TIMER_HZ> = on_time.convert();
+    pwm_ticks.ticks().min(u16::MAX as u32) as u16
+}
+
+fn calculate_speed(magnet_speed: TimerDurationU64<1_000_000>) -> f32 {
     let dur_sec = magnet_speed.ticks() as f32 / 1_000_000.0;
 
     LENGTH_PER_HAL_RISE_METERS / dur_sec

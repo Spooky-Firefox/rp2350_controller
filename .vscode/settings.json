@@ -5,4 +5,11 @@
       "rust-analyzer.check.targets": [
     "thumbv8m.main-none-eabihf"
   ],
+  "cSpell.words": [
+    "CPACR",
+    "defmt",
+    "plls",
+    "rtic",
+    "XTAL"
+  ],
 }

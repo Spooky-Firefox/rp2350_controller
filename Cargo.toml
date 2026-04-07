@@ -15,6 +15,7 @@ rtic-monotonics = {version = "2.1.0", features = ["rp235x"]}
 rp235x-pac = "0.1.0"
 embedded-io = "0.7.1"
 embedded-hal = "1.0.0"
+fugit = "0.3.9"
 
 [profile.dev]
 codegen-units = 1

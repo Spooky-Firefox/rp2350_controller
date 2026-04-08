@@ -24,17 +24,22 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
+// Wheel geometry: arc length per magnet pulse (used to convert time into speed).
 const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 
-const SYS_CLOCK_HZ: u32 = 125_000_000;
+// CPU clock speed (150 MHz). All timers and PWM are derived from this.
+const SYS_CLOCK_HZ: u32 = 150_000_000;
 const PWM_DIV_INT: u8 = 64;
 const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / PWM_DIV_INT as u32;
 
+// Standard RC-servo frame period (50 Hz).
 const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);
 const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_500);
 
+// Shorthand for GPIO25 configured as a digital output (LED pin).
 type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
 
+// Shorthand for GPIO13 configured as a digital input with pull-up (encoder pin).
 type EncoderPin = gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
 
 type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm7, hal::pwm::FreeRunning>;
@@ -42,7 +47,6 @@ type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm7, hal::pwm::FreeRunning>;
 type MotorPwmPinA = gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionPwm, gpio::PullDown>;
 
 type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionPwm, gpio::PullDown>;
-
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0])]
 mod app {
 
@@ -56,6 +60,7 @@ mod app {
 
     #[shared]
     struct Shared {
+        // Updated by encoder IRQ, read by idle for speed logging.
         encoder_time_diff: TimerDurationU64<1_000_000>,
         usb_dev: UsbDevice<'static, MyUsbBus>,
         serial: SerialPort<'static, MyUsbBus>,
@@ -114,12 +119,14 @@ mod app {
 
         let onboard_led = pins.gpio25.into_push_pull_output();
 
+        // Configure PWM peripheral for servo/motor control (20 ms period = 50 Hz).
         let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
         let mut pwm = pwm_slices.pwm7;
-        pwm.set_div_int(PWM_DIV_INT);
+        pwm.set_div_int(PWM_DIV_INT); // Clock divider to reach desired PWM frequency.
         let period_ticks: fugit::TimerDurationU32<PWM_TIMER_HZ> = PWM_PERIOD.convert();
-        pwm.set_top(period_ticks.ticks().saturating_sub(1) as u16);
-        pwm.enable();
+        pwm.set_top(period_ticks.ticks().saturating_sub(1) as u16); // Set 20 ms period.
+        pwm.enable(); // Start the PWM counter.
+        // Attach PWM channels to pins and set initial position (1500 µs = center).
         let pwm_a_pin = pwm.channel_a.output_to(pins.gpio14);
         let pwm_b_pin = pwm.channel_b.output_to(pins.gpio15);
         let _ = pwm
@@ -131,8 +138,10 @@ mod app {
         pwm.channel_a.set_enabled(true);
         pwm.channel_b.set_enabled(true);
 
+        // Spawn the toggle_led task to run periodically.
         toggle_led::spawn().unwrap();
 
+        // Configure encoder input and enable interrupt on rising edges (magnet passes sensor).
         let encoder = pins.gpio13.into_pull_up_input();
         encoder.set_interrupt_enabled(rp235x_hal::gpio::Interrupt::EdgeHigh, true);
 
@@ -166,7 +175,7 @@ mod app {
                 "encoder speed : {} m/s",
                 calculate_speed(ctx.shared.encoder_time_diff.lock(|diff| *diff))
             );
-            delay(100_000_000);
+            delay(100_000_000); // Small delay to avoid spam (CPU-blocking, not ideal).
         }
     }
 
@@ -189,7 +198,7 @@ mod app {
         {
             trace!("encoder edge high cnt {}", ctx.local.cnt);
 
-            // Calculate the time difference between this edge and the last edge, and store it in the shared resource.
+            // Measure period between two encoder edges for speed calculation.
             let now = MainMono::now();
             let time_diff = now - *ctx.local.encoder_last_time;
             *ctx.local.encoder_last_time = now;
@@ -232,7 +241,7 @@ mod app {
         }
 
         if *buff_len > 0 && buff[*buff_len - 1] == b'\n' {
-            // if the last byte in the buffer is a newline, then we consider this a complete command and print it out, then reset the buffer length to 0.
+            // Newline-terminated command framing.
             let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");
             let command = command.trim();
             info!("Received command: {}", command);
@@ -269,17 +278,20 @@ mod app {
     }
 }
 
+// Parse USB command argument as microseconds. Returns None if not a valid number.
 fn parse_on_time_us(arg: &str) -> Option<u32> {
     arg.trim().parse::<u32>().ok()
 }
 
+// Convert microseconds to PWM counter ticks at the PWM timer frequency.
 fn micros_to_pwm_ticks(on_time: MicrosDurationU32) -> u16 {
     let pwm_ticks: TimerDurationU32<PWM_TIMER_HZ> = on_time.convert();
-    pwm_ticks.ticks().min(u16::MAX as u32) as u16
+    pwm_ticks.ticks().min(u16::MAX as u32) as u16 // Clamp to 16-bit register width.
 }
 
 fn calculate_speed(magnet_speed: TimerDurationU64<1_000_000>) -> f32 {
     let dur_sec = magnet_speed.ticks() as f32 / 1_000_000.0;
 
+    // v = distance per encoder pulse / pulse period.
     LENGTH_PER_HAL_RISE_METERS / dur_sec
 }

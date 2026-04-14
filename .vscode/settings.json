@@ -2,6 +2,7 @@
     "rust-analyzer.cargo.target": "thumbv8m.main-none-eabihf",
     "rust-analyzer.check.allTargets": false,
     "rust-analyzer.cargo.features": [],
+    "matlab.installPath": "/usr/local/MATLAB/",
       "rust-analyzer.check.targets": [
     "thumbv8m.main-none-eabihf"
   ],

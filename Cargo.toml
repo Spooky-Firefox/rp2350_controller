@@ -16,6 +16,7 @@ rp235x-pac = "0.1.0"
 embedded-io = "0.7.1"
 embedded-hal = "1.0.0"
 fugit = "0.3.9"
+libm = "0.2"
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 

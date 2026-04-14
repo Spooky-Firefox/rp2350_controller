@@ -39,10 +39,11 @@ function sim_data = generate_kalman_data(output_file)
     N      = length(t_sim);
 
     % Steering and acceleration profiles define the simulated path.
-    delta_true = 0.3 * sin(2*pi*0.2*t_sim);
-    %delta_true = 0.3*ones(size(t_sim));
+    %delta_true = 0.3 * sin(2*pi*0.2*t_sim);
+    delta_true = 0*ones(size(t_sim));
+    
     a_long_true = 0.8 * ones(size(t_sim));
-    a_long_true(t_sim > 6 & t_sim < 8) = -3.5;
+    a_long_true(t_sim > 5 & t_sim < 7) = -2.5;
 
     % Integrate the bicycle model to create the ground-truth trajectory.
     x_true = zeros(4, N);

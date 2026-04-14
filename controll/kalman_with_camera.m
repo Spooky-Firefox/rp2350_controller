@@ -86,7 +86,7 @@ delta_true  = sim_data.delta_true;
 a_long_true = sim_data.a_long_true;
 x_true      = sim_data.x_true;
 
-%% =================== GENERATE NOISY MEASUREMENTS ===================
+%% =================== GET MEASUREMENTS ===================
 cam_idx    = sim_data.cam_idx;
 z_cam      = sim_data.z_cam;
 axle_times = sim_data.axle_times;
@@ -197,20 +197,6 @@ fprintf('  Speed      : %.4f m/s\n', rmse_v);
 %%                       LOCAL FUNCTIONS
 %% =====================================================================
 
-function x_next = bicycle_step(x, delta, a_long, dt, C)
-    % One Euler step of the kinematic bicycle model.
-    X     = x(1);
-    Y     = x(2);
-    theta = x(3);
-    v     = x(4);
-
-    x_next = [
-        X     + v * cos(theta) * dt
-        Y     + v * sin(theta) * dt
-        wrap_pi(theta + (v / C.L) * tan(delta) * dt)
-        v     + a_long * dt
-    ];
-end
 
 function [x_p, P_p] = ekf_predict(x, P, u, dt, C)
     % EKF PREDICTION STEP

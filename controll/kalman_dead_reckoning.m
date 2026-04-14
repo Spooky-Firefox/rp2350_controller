@@ -107,7 +107,7 @@ for k = 2:N
 end
 
 %% =================== PLOTS ===================
-figure('Name','EKF Dead Reckoning (No Camera)','Position',[100 100 1200 800]);
+figure('Name','EKF Dead Reckoning','Position',[100 100 1200 800]);
 
 % --- Trajectory ---
 subplot(2,3,1); hold on; grid on;
@@ -177,20 +177,6 @@ fprintf('Speed RMSE should remain bounded (axle sensor constrains it).\n');
 %% =====================================================================
 %%                       LOCAL FUNCTIONS
 %% =====================================================================
-
-function x_next = bicycle_step(x, delta, a_long, dt, C)
-    X     = x(1);
-    Y     = x(2);
-    theta = x(3);
-    v     = x(4);
-
-    x_next = [ 
-        X     + v * cos(theta) * dt
-        Y     + v * sin(theta) * dt
-        wrap_pi(theta + (v / C.L) * tan(delta) * dt)
-        v     + a_long * dt
-    ];
-end
 
 function [x_p, P_p] = ekf_predict(x, P, u, dt, C)
     theta = x(3);

@@ -20,6 +20,9 @@ libm = "0.2"
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 
+[features]
+echo_usb = []
+
 [profile.dev]
 codegen-units = 1
 debug = 2

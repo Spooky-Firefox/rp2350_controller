@@ -42,11 +42,11 @@ type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::Pull
 // Shorthand for GPIO13 configured as a digital input with pull-up (encoder pin).
 type EncoderPin = gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
 
-type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm7, hal::pwm::FreeRunning>;
+type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm0, hal::pwm::FreeRunning>;
 
-type MotorPwmPinA = gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionPwm, gpio::PullDown>;
+type MotorPwmPinA = gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionPwm, gpio::PullDown>;
 
-type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionPwm, gpio::PullDown>;
+type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio17, gpio::FunctionPwm, gpio::PullDown>;
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0])]
 mod app {
 
@@ -121,14 +121,14 @@ mod app {
 
         // Configure PWM peripheral for servo/motor control (20 ms period = 50 Hz).
         let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
-        let mut pwm = pwm_slices.pwm7;
+        let mut pwm = pwm_slices.pwm0;
         pwm.set_div_int(PWM_DIV_INT); // Clock divider to reach desired PWM frequency.
         let period_ticks: fugit::TimerDurationU32<PWM_TIMER_HZ> = PWM_PERIOD.convert();
         pwm.set_top(period_ticks.ticks().saturating_sub(1) as u16); // Set 20 ms period.
         pwm.enable(); // Start the PWM counter.
         // Attach PWM channels to pins and set initial position (1500 µs = center).
-        let pwm_a_pin = pwm.channel_a.output_to(pins.gpio14);
-        let pwm_b_pin = pwm.channel_b.output_to(pins.gpio15);
+        let pwm_a_pin = pwm.channel_a.output_to(pins.gpio16);
+        let pwm_b_pin = pwm.channel_b.output_to(pins.gpio17);
         let _ = pwm
             .channel_a
             .set_duty_cycle(micros_to_pwm_ticks(PWM_DEFAULT_ON_TIME));
@@ -211,14 +211,16 @@ mod app {
 
     #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0, pwm], shared = [usb_dev, serial], priority = 2)]
     fn usb_interrupt(ctx: usb_interrupt::Context) {
-        let usb_dev = ctx.shared.usb_dev;
-        let serial = ctx.shared.serial;
+        info!("usb interrupt");
+        let mut usb_dev = ctx.shared.usb_dev;
+        let mut serial = ctx.shared.serial;
 
         let buff = ctx.local.buff;
         let buff_len = ctx.local.buff_len;
 
         // read data from usb serial and store it in the local buffer. The buffer length is stored in a local variable as well.
-        (usb_dev, serial).lock(|usb_dev, serial| {
+        let mut bytes_read = 0;
+        (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
             if !usb_dev.poll(&mut [serial]) {
                 return;
             }
@@ -230,7 +232,19 @@ mod app {
                 if count == 0 {
                     break;
                 }
+                bytes_read += count;
                 *buff_len += count;
+            }
+
+            // Echo received data back to USB if feature is enabled (skip CR/LF to avoid cursor jumping)
+            #[cfg(feature = "echo_usb")]
+            if bytes_read > 0 {
+                for &byte in &buff[*buff_len - bytes_read..*buff_len] {
+                    if byte != b'\r' && byte != b'\n' {
+                        let _ = serial.write(&[byte]);
+                    }
+                }
+                usb_dev.poll(&mut [serial]);
             }
         });
 
@@ -240,7 +254,7 @@ mod app {
             return;
         }
 
-        if *buff_len > 0 && buff[*buff_len - 1] == b'\n' {
+        if *buff_len > 0 && (buff[*buff_len - 1] == b'\n' || buff[*buff_len - 1] == b'\r') {
             // Newline-terminated command framing.
             let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");
             let command = command.trim();
@@ -257,6 +271,13 @@ mod app {
                         on_time.ticks(),
                         ticks
                     );
+
+                    // Echo success if feature is enabled
+                    #[cfg(feature = "echo_usb")]
+                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
+                        let _ = serial.write(b"\r\nOK\r\n");
+                        usb_dev.poll(&mut [serial]);
+                    });
                 } else {
                     info!("Invalid pwm-a value: {}", rest);
                 }
@@ -270,9 +291,23 @@ mod app {
                         on_time.ticks(),
                         ticks
                     );
+
+                    // Echo success if feature is enabled
+                    #[cfg(feature = "echo_usb")]
+                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
+                        let _ = serial.write(b"\r\nOK\r\n");
+                        usb_dev.poll(&mut [serial]);
+                    });
                 } else {
                     info!("Invalid pwm-b value: {}", rest);
                 }
+            } else {
+                info!("Unknown command: {}", command);
+                #[cfg(feature = "echo_usb")]
+                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
+                    let _ = serial.write(b"\r\nERR: unknown/malformed command\r\n");
+                    usb_dev.poll(&mut [serial]);
+                });
             }
         }
     }

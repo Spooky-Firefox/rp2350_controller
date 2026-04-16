@@ -16,6 +16,13 @@ use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
 use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
 use usbd_serial::SerialPort;
 
+
+use hal::multicore::Stack;
+// 2^16 = 65536 bytes = 64 KB stack size for core 1 (adjust as needed).
+static  mut CORE1_STACK: Stack<65536> = Stack::new();
+
+
+
 /// Required by the RP2350 bootrom to identify and validate the image.
 #[allow(unsafe_code)]
 #[unsafe(link_section = ".start_block")]
@@ -253,7 +260,6 @@ mod app {
             *buff_len = 0;
             return;
         }
-
         if *buff_len > 0 && (buff[*buff_len - 1] == b'\n' || buff[*buff_len - 1] == b'\r') {
             // Newline-terminated command framing.
             let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");

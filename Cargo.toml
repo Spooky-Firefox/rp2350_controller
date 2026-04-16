@@ -21,6 +21,7 @@ usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 
 [features]
+default = ["echo_usb"]
 echo_usb = []
 
 [profile.dev]

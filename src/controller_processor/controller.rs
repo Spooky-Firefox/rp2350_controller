@@ -1,30 +1,50 @@
 pub trait Controller {
-    fn update(&mut self, state: &[f32; 4]) -> [f32; 2];
-    fn set_setpoint(&mut self, setpoint: [f32; 4]);
+    fn update(&mut self, speed_mps: f32, dt_s: f32) -> [u16; 2];
+    fn set_speed_setpoint(&mut self, setpoint_mps: f32);
 }
-pub struct PIDController {
+
+pub struct StraightLineSpeedController {
     pub kp: f32,
     pub ki: f32,
     pub kd: f32,
-    pub setpoint: [f32; 4],
-    pub integral: [f32; 4],
-    pub previous_error: [f32; 4],
+    pub speed_setpoint_mps: f32,
+    pub integral_error: f32,
+    pub previous_error: f32,
+    pub integral_limit: f32,
+    pub steering_pwm_us: u16,
+    pub neutral_power_pwm_us: u16,
 }
 
-impl Controller for PIDController {
-    fn update(&mut self, state: &[f32; 4]) -> [f32; 2] {
-        let mut output = [0.0; 2];
-        for i in 0..4 {
-            let error = self.setpoint[i] - state[i];
-            self.integral[i] += error;
-            let derivative = error - self.previous_error[i];
-            output[0] += self.kp * error + self.ki * self.integral[i] + self.kd * derivative;
-            output[1] += self.kp * error + self.ki * self.integral[i] + self.kd * derivative;
-            self.previous_error[i] = error;
+impl Controller for StraightLineSpeedController {
+    fn update(&mut self, speed_mps: f32, dt_s: f32) -> [u16; 2] {
+        let error = self.speed_setpoint_mps - speed_mps;
+
+        if dt_s > 0.0 {
+            self.integral_error += error * dt_s;
+            self.integral_error = self
+                .integral_error
+                .clamp(-self.integral_limit, self.integral_limit);
         }
-        output
+
+        let derivative = if dt_s > 0.0 {
+            (error - self.previous_error) / dt_s
+        } else {
+            0.0
+        };
+        self.previous_error = error;
+
+        let power_pwm = (
+            self.neutral_power_pwm_us as f32
+                + self.kp * error
+                + self.ki * self.integral_error
+                + self.kd * derivative
+        )
+            .clamp(1000.0, 2000.0) as u16;
+
+        [self.steering_pwm_us, power_pwm]
     }
-    fn set_setpoint(&mut self, setpoint: [f32; 4]) {
-        self.setpoint = setpoint;
+
+    fn set_speed_setpoint(&mut self, setpoint_mps: f32) {
+        self.speed_setpoint_mps = setpoint_mps;
     }
 }

@@ -11,7 +11,7 @@
 //! # API
 //! | Function | When to call | What it does |
 //! |---|---|---|
-//! | [`EkfFilter::on_rpm_sample`] | RPM interrupt | predict(dt) → update with ω |
+//! | [`EkfFilter::on_speed_sample`] | Hall pulse interrupt | predict(dt) → update with v |
 //! | [`EkfFilter::on_timeout`]    | watchdog task, no RPM arrived | predict(dt) only |
 //! | [`EkfFilter::set_control`]   | whenever control changes | store δ, a_long |
 //!
@@ -39,9 +39,6 @@ type Instant = TimerInstantU64<1_000_000>;
 pub struct EkfConst {
     /// Wheelbase [m].
     pub l: f32,
-    /// `v_linear = omega_axle_sensor * speed_ratio`  [m/rad].
-    /// Typically `r_wheel / gear_ratio`.
-    pub speed_ratio: f32,
 
     // --- Process noise (continuous-time std-dev, scaled by dt inside predict) ---
     /// Position noise [m/s].  Higher = more model uncertainty in X, Y.
@@ -52,8 +49,8 @@ pub struct EkfConst {
     pub q_v: f32,
 
     // --- Measurement noise ---
-    /// Axle angular speed sensor noise std-dev [rad/s].
-    pub r_omega: f32,
+    /// Longitudinal speed measurement noise std-dev [m/s].
+    pub r_speed: f32,
 
     // --- Numerics ---
     /// Smoothing term to avoid |v| Jacobian singularity near v = 0 [m/s].
@@ -115,20 +112,20 @@ impl EkfFilter {
 
     // ── Event entry points ───────────────────────────────────────────────────
 
-    /// **Call from the RPM interrupt** each time a new axle speed pulse arrives.
+    /// **Call from the hall pulse interrupt** each time a new speed sample arrives.
     ///
     /// Runs `predict(dt)` from the last filter time to `now`, then corrects
-    /// the speed state with the new angular speed measurement.
+    /// the speed state with the new linear speed measurement.
     ///
-    /// - `omega_meas` : absolute axle angular speed [rad/s]  (≥ 0, no sign)
+    /// - `speed_meas` : absolute longitudinal speed [m/s]  (≥ 0, no sign)
     /// - `now`        : interrupt timestamp from `MainMono::now()`
-    pub fn on_rpm_sample(&mut self, omega_meas: f32, now: Instant) {
+    pub fn on_speed_sample(&mut self, speed_meas: f32, now: Instant) {
         let dt_s = self.dt_seconds(now);
         self.t_last = now;
         if dt_s > 0.0 {
             self.predict(dt_s);
         }
-        self.update_axle(omega_meas);
+        self.update_speed(speed_meas);
     }
 
     /// **Call from a watchdog / periodic task** when no RPM sample has arrived
@@ -227,29 +224,28 @@ impl EkfFilter {
         self.p = fpfT_plus_q(&self.p, f02, f03, f12, f13, f23, q0, q2, q3);
     }
 
-    /// EKF measurement update — absolute axle speed (no sign).
+    /// EKF measurement update — absolute longitudinal speed (no sign).
     ///
-    /// Matches `ekf_update_axle_speed()` in `kalman_dead_reckoning.m`.
-    fn update_axle(&mut self, omega_meas: f32) {
+    /// Measurement model: `z = |v| + noise`.
+    fn update_speed(&mut self, speed_meas: f32) {
         let v = self.x[3];
-        let sr = self.c.speed_ratio;
         let eps = self.c.eps_v;
 
         // Smoothed |v| to avoid singularity at v = 0
         let v_abs = libm::sqrtf(v * v + eps * eps);
 
-        // Predicted measurement: h(x) = |v| / speed_ratio
-        let h_pred = v_abs / sr;
+        // Predicted measurement: h(x) = |v|
+        let h_pred = v_abs;
 
         // Jacobian H = [0, 0, 0, dh/dv]  (1×4)
-        let dh_dv = v / (v_abs * sr);
+        let dh_dv = v / v_abs;
 
         // Innovation
-        let y_inn = omega_meas - h_pred;
+        let y_inn = speed_meas - h_pred;
 
         // S = H*P*H' + R  (scalar, since H is 1×4 with only index-3 nonzero)
-        //   = dh_dv² * P[3][3] + r_omega²
-        let r = self.c.r_omega * self.c.r_omega;
+        //   = dh_dv² * P[3][3] + r_speed²
+        let r = self.c.r_speed * self.c.r_speed;
         let p33 = self.p[3 * 4 + 3];
         let s = dh_dv * dh_dv * p33 + r;
 

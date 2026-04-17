@@ -2,16 +2,16 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-use core::f32::consts::PI;
 
 use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
-use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32, TimerDurationU64};
+use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32};
 use hal::gpio;
 use panic_probe as _;
 use rp235x_hal as hal;
 use rp235x_pac as pac;
 use rp2350_controller::entry::entry;
+use rp2350_controller::ipc;
 use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
 use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
 use usbd_serial::SerialPort;
@@ -30,9 +30,6 @@ static  mut CORE1_STACK: Stack<65536> = Stack::new();
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-// Wheel geometry: arc length per magnet pulse (used to convert time into speed).
-const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 
 // CPU clock speed (150 MHz). All timers and PWM are derived from this.
 const SYS_CLOCK_HZ: u32 = 150_000_000;
@@ -54,10 +51,9 @@ type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm0, hal::pwm::FreeRunning>;
 type MotorPwmPinA = gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionPwm, gpio::PullDown>;
 
 type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio17, gpio::FunctionPwm, gpio::PullDown>;
-#[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0])]
+#[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0, DMA_IRQ_1])]
 mod app {
 
-    use cortex_m::asm::delay;
     use defmt::{info, trace};
     use embedded_hal::pwm::SetDutyCycle;
     use fugit::{MicrosDurationU32, TimerInstantU64};
@@ -67,10 +63,11 @@ mod app {
 
     #[shared]
     struct Shared {
-        // Updated by encoder IRQ, read by idle for speed logging.
-        encoder_time_diff: TimerDurationU64<1_000_000>,
         usb_dev: UsbDevice<'static, MyUsbBus>,
         serial: SerialPort<'static, MyUsbBus>,
+        pwm: MotorPwmSlice,
+        speed_setpoint_mps: f32,
+        last_sensor_irq_us: u64,
     }
 
     #[local]
@@ -78,7 +75,6 @@ mod app {
         encoder: EncoderPin,
         encoder_last_time: TimerInstantU64<1_000_000>,
         led: LedPin,
-        pwm: MotorPwmSlice,
         _pwm_a_pin: MotorPwmPinA,
         _pwm_b_pin: MotorPwmPinB,
     }
@@ -121,7 +117,7 @@ mod app {
 
         let pads_bank = pac.PADS_BANK0;
         let io_bank = pac.IO_BANK0;
-        let sio = hal::Sio::new(pac.SIO);
+        let mut sio = hal::Sio::new(pac.SIO);
         let pins = hal::gpio::Pins::new(io_bank, pads_bank, sio.gpio_bank0, &mut pac.RESETS);
 
         let onboard_led = pins.gpio25.into_push_pull_output();
@@ -145,44 +141,48 @@ mod app {
         pwm.channel_a.set_enabled(true);
         pwm.channel_b.set_enabled(true);
 
-        // Spawn the toggle_led task to run periodically.
-        toggle_led::spawn().unwrap();
-
         // Configure encoder input and enable interrupt on rising edges (magnet passes sensor).
         let encoder = pins.gpio13.into_pull_up_input();
         encoder.set_interrupt_enabled(rp235x_hal::gpio::Interrupt::EdgeHigh, true);
 
+        // Spawn Core 1 for controller processing.
+        #[allow(unsafe_code)]
+        {
+            let mut mc =
+                hal::multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+            let cores = mc.cores();
+            let core1 = &mut cores[1];
+            let stack = unsafe { (*(&raw mut CORE1_STACK)).take().unwrap() };
+            let _ = core1.spawn(stack, move || {
+                rp2350_controller::controller_processor::controller_processor_loop::core1_task();
+            });
+        }
+
         MainMono::start(pac.TIMER0, &pac.RESETS);
+        toggle_led::spawn().unwrap();
+        sensor_timeout::spawn().unwrap();
         (
             Shared {
-                encoder_time_diff: TimerDurationU64::<1_000_000>::from_ticks(0),
                 usb_dev,
                 serial,
+                pwm,
+                speed_setpoint_mps: 0.0,
+                last_sensor_irq_us: 0,
             },
             Local {
                 led: onboard_led,
                 encoder,
                 encoder_last_time: TimerInstantU64::<1_000_000>::from_ticks(0),
-                pwm,
                 _pwm_a_pin: pwm_a_pin,
                 _pwm_b_pin: pwm_b_pin,
             },
         )
     }
 
-    #[idle(shared = [encoder_time_diff])]
-    fn idle(mut ctx: idle::Context) -> ! {
+    #[idle]
+    fn idle(_ctx: idle::Context) -> ! {
         loop {
-            //info!("sleeping");
-            trace!(
-                "secs measured: {}",
-                (ctx.shared.encoder_time_diff.lock(|diff| *diff).ticks() as f32) / 1_000_000.0
-            );
-            info!(
-                "encoder speed : {} m/s",
-                calculate_speed(ctx.shared.encoder_time_diff.lock(|diff| *diff))
-            );
-            delay(100_000_000); // Small delay to avoid spam (CPU-blocking, not ideal).
+            cortex_m::asm::wfe();
         }
     }
 
@@ -194,7 +194,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [encoder_time_diff], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, last_sensor_irq_us], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -205,22 +205,72 @@ mod app {
         {
             trace!("encoder edge high cnt {}", ctx.local.cnt);
 
-            // Measure period between two encoder edges for speed calculation.
             let now = MainMono::now();
-            let time_diff = now - *ctx.local.encoder_last_time;
+            let previous = *ctx.local.encoder_last_time;
             *ctx.local.encoder_last_time = now;
-            ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
+            ctx.shared.last_sensor_irq_us.lock(|last| *last = now.ticks());
+
+            if previous.ticks() != 0 {
+                let time_diff = now - previous;
+                let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
+
+                // Steering is stubbed to 0.0 for now.
+                let event = ipc::SensorEvent::rpm_and_steer(
+                    now.ticks(),
+                    setpoint_mps,
+                    0.0,
+                    time_diff.ticks() as f32,
+                );
+                cortex_m::interrupt::free(|_| ipc::send_sensor_event(&event));
+            }
+
             ctx.local
                 .encoder
                 .clear_interrupt(hal::gpio::Interrupt::EdgeHigh);
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0, pwm], shared = [usb_dev, serial], priority = 2)]
-    fn usb_interrupt(ctx: usb_interrupt::Context) {
+    #[task(shared = [speed_setpoint_mps, last_sensor_irq_us], priority = 2)]
+    async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
+        loop {
+            MainMono::delay(100u64.millis()).await;
+
+            let now = MainMono::now().ticks();
+            let last_sensor_irq_us = ctx.shared.last_sensor_irq_us.lock(|last| *last);
+
+            if now.saturating_sub(last_sensor_irq_us) >= 100_000 {
+                let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
+                let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
+                cortex_m::interrupt::free(|_| ipc::send_sensor_event(&event));
+            }
+        }
+    }
+
+    /// Receives control events from Core 1 and applies PWM outputs.
+    #[task(binds = SIO_IRQ_FIFO, shared = [pwm], priority = 2)]
+    fn sio_interrupt(ctx: sio_interrupt::Context) {
+        let mut pwm = ctx.shared.pwm;
+
+        while let Some(ctrl) = ipc::try_recv_control_event() {
+            let steer_on = MicrosDurationU32::from_ticks(ctrl.steer_pwm_us as u32).min(PWM_PERIOD);
+            let power_on = MicrosDurationU32::from_ticks(ctrl.power_pwm_us as u32).min(PWM_PERIOD);
+            pwm.lock(|pwm| {
+                let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
+                let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+            });
+            info!(
+                "ctrl: steer={} us  power={} us",
+                ctrl.steer_pwm_us, ctrl.power_pwm_us
+            );
+        }
+    }
+
+    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial, pwm, speed_setpoint_mps], priority = 2)]
+    fn usb_interrupt(mut ctx: usb_interrupt::Context) {
         info!("usb interrupt");
         let mut usb_dev = ctx.shared.usb_dev;
         let mut serial = ctx.shared.serial;
+        let mut pwm = ctx.shared.pwm;
 
         let buff = ctx.local.buff;
         let buff_len = ctx.local.buff_len;
@@ -271,7 +321,9 @@ mod app {
                 if let Some(on_time_us) = parse_on_time_us(rest) {
                     let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
                     let ticks = micros_to_pwm_ticks(on_time);
-                    let _ = ctx.local.pwm.channel_a.set_duty_cycle(ticks);
+                    pwm.lock(|pwm| {
+                        let _ = pwm.channel_a.set_duty_cycle(ticks);
+                    });
                     info!(
                         "Set PWM A on-time to {} us ({} ticks)",
                         on_time.ticks(),
@@ -287,11 +339,26 @@ mod app {
                 } else {
                     info!("Invalid pwm-a value: {}", rest);
                 }
+            } else if let Some(rest) = command.strip_prefix("speed ") {
+                if let Some(setpoint_mps) = parse_speed_setpoint(rest) {
+                    ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = setpoint_mps);
+                    info!("Set speed setpoint to {} m/s", setpoint_mps);
+
+                    #[cfg(feature = "echo_usb")]
+                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
+                        let _ = serial.write(b"\r\nOK\r\n");
+                        usb_dev.poll(&mut [serial]);
+                    });
+                } else {
+                    info!("Invalid speed value: {}", rest);
+                }
             } else if let Some(rest) = command.strip_prefix("pwm-b ") {
                 if let Some(on_time_us) = parse_on_time_us(rest) {
                     let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
                     let ticks = micros_to_pwm_ticks(on_time);
-                    let _ = ctx.local.pwm.channel_b.set_duty_cycle(ticks);
+                    pwm.lock(|pwm| {
+                        let _ = pwm.channel_b.set_duty_cycle(ticks);
+                    });
                     info!(
                         "Set PWM B on-time to {} us ({} ticks)",
                         on_time.ticks(),
@@ -324,15 +391,12 @@ fn parse_on_time_us(arg: &str) -> Option<u32> {
     arg.trim().parse::<u32>().ok()
 }
 
+fn parse_speed_setpoint(arg: &str) -> Option<f32> {
+    arg.trim().parse::<f32>().ok()
+}
+
 // Convert microseconds to PWM counter ticks at the PWM timer frequency.
 fn micros_to_pwm_ticks(on_time: MicrosDurationU32) -> u16 {
     let pwm_ticks: TimerDurationU32<PWM_TIMER_HZ> = on_time.convert();
     pwm_ticks.ticks().min(u16::MAX as u32) as u16 // Clamp to 16-bit register width.
-}
-
-fn calculate_speed(magnet_speed: TimerDurationU64<1_000_000>) -> f32 {
-    let dur_sec = magnet_speed.ticks() as f32 / 1_000_000.0;
-
-    // v = distance per encoder pulse / pulse period.
-    LENGTH_PER_HAL_RISE_METERS / dur_sec
 }

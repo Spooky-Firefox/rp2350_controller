@@ -4,11 +4,12 @@
 
 This program runs on an **RP2350 microcontroller** (the chip on a Raspberry Pi Pico 2 board). Unlike a regular computer, a microcontroller has no operating system — our program *is* the only thing running. It starts at power-on and runs forever.
 
-The program does three things:
+The program does four things:
 
-1. **Controls two servo/motor outputs** via PWM signals (GPIO 14 and 15)
+1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
 2. **Measures rotation speed** from a Hall-effect encoder (GPIO 13)
-3. **Receives commands** from a PC over USB serial
+3. **Runs a Kalman-filtered speed controller** on a dedicated second CPU core
+4. **Receives commands** from a PC over USB serial
 
 ---
 
@@ -20,7 +21,9 @@ Each task has a **priority level** — higher priority tasks can interrupt lower
 
 ```text
 Priority 3 (highest) │  gpio_interrupt   — encoder edge detected
-Priority 2           │  usb_interrupt    — USB data arrived
+Priority 2           │  sio_interrupt    — control output from Core 1
+                     │  sensor_timeout   — no encoder pulse for 100 ms
+                     │  usb_interrupt    — USB data arrived
 Priority 1           │  toggle_led       — periodic heartbeat
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
@@ -29,11 +32,45 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 
 | Task | Trigger | What it does |
 |------|---------|--------------|
-| `init` | Power-on, once | Sets up all hardware |
-| `idle` | Always (background) | Prints current speed to debug log |
+| `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
+| `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
 | `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 13 | Records the time between encoder pulses |
-| `usb_interrupt` | USB data received | Reads commands and adjusts PWM output |
+| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, sends `SensorEvent` to Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Sends a timeout event to Core 1 so the filter can coast |
+| `sio_interrupt` | Core 1 writes to FIFO | Receives `ControlEvent` and applies PWM outputs |
+| `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
+
+---
+
+## Dual-Core Architecture
+
+The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
+
+```text
+ ┌──────────────────────────┐         ┌──────────────────────────┐
+ │         Core 0           │  FIFO   │         Core 1           │
+ │                          │ ──────> │                          │
+ │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
+ │  - encoder ISR           │ Events  │  - Kalman filter         │
+ │  - USB serial            │         │  - PID speed controller  │
+ │  - PWM output            │ <────── │                          │
+ │  - sensor timeout        │ Control │                          │
+ │                          │ Events  │                          │
+ └──────────────────────────┘         └──────────────────────────┘
+```
+
+**Core 0** handles all I/O — interrupts, USB, PWM. **Core 1** runs the computationally heavier control loop (EKF + PID). They communicate through the SIO hardware FIFO.
+
+### Inter-Core Communication (IPC)
+
+The two cores talk through a **32-bit hardware FIFO** built into the RP2350's SIO peripheral. Each core has its own TX and RX side — data written by one core appears on the other's read side.
+
+| Direction | Message | Size | Content |
+|-----------|---------|------|---------|
+| Core 0 → Core 1 | `SensorEvent` | 6 words | timestamp, speed setpoint, steering, encoder period |
+| Core 1 → Core 0 | `ControlEvent` | 1 word | steering PWM + power PWM packed into 16 bits each |
+
+The `FifoChannel` struct owns the `SioFifo` from the HAL, so all FIFO access is safe — no raw pointer manipulation. See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on what Core 1 does with these events.
 
 ---
 
@@ -54,7 +91,7 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 - Default on-time: **1500 µs** (center position)
 - Range is typically 1000–2000 µs
 
-There are two independent channels: **PWM-A** (GPIO 14) and **PWM-B** (GPIO 15).
+There are two independent channels: **PWM-A** (GPIO 16) and **PWM-B** (GPIO 17).
 
 ---
 
@@ -79,25 +116,37 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 | Command | Example | Effect |
 |---------|---------|--------|
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
+| `speed <m/s>` | `speed 1.2` | Set the speed controller target to 1.2 m/s |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
 
-Commands must end with a newline (`\n`). The maximum on-time is capped at 20 000 µs (the full period).
+Commands must end with a newline (`\n`). PWM values are capped at the 20 000 µs frame period, and the controller itself later clamps output to the usual servo range of roughly 1000-2000 µs.
+
+`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1.
 
 ---
 
 ## Shared Data and Why Locking Matters
 
-Some data is **shared** between tasks — for example, `encoder_time_diff` is written by `gpio_interrupt` and read by `idle`. Because a higher-priority task can interrupt a lower-priority one *mid-read*, reading a half-updated value is possible without protection.
+Some data is **shared** between RTIC tasks. In the current code, examples include:
+
+- `speed_setpoint_mps`: written by `usb_interrupt`, read by `gpio_interrupt` and `sensor_timeout`
+- `last_sensor_irq_us`: written by `gpio_interrupt`, read by `sensor_timeout`
+- `fifo`: used by both the sensor-producing tasks and the SIO receive task
+- `pwm`: updated by both USB commands and control messages from Core 1
+
+Because a higher-priority task can interrupt a lower-priority one mid-read or mid-write, shared state must be protected.
 
 > **Race condition (brief):** If task A is halfway through writing a value and task B reads it, B gets garbage. This is a race condition — the result depends on timing, which is unpredictable.
 
-RTIC prevents this by requiring a **lock** whenever shared data is accessed. While a task holds the lock, no other task can interrupt and touch the same data. You'll see this in code as:
+RTIC prevents this by requiring a **lock** whenever shared data is accessed. While a task holds the lock, no other task can interrupt and touch the same resource. You'll see this in code as:
 
 ```rust
-ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
+ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 ```
 
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
+
+For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a raw register block. Core 0 locks it before sending or receiving FIFO messages; Core 1 owns its own `FifoChannel` instance in its blocking loop.
 
 ---
 
@@ -159,10 +208,10 @@ In Python this would be `def add(a, b): return a + b`. The last expression in a 
 Closures are the `|variable| expression` syntax you'll see throughout the code:
 
 ```rust
-ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
+ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 ```
 
-The `|diff|` part is like Python's `lambda diff:` — it defines an anonymous function that receives `diff` as an argument. This particular line means: *"acquire the lock, then run this small function with the protected value"*.
+The `|setpoint|` part is like Python's `lambda setpoint:` — it defines an anonymous function that receives `setpoint` as an argument. This particular line means: *"acquire the lock, then run this small function with the protected value"*.
 
 Another example with a longer body:
 
@@ -205,11 +254,11 @@ let clocks = init_clocks_and_plls(...).unwrap();
 The `&` prefix means "a reference to" (a pointer, not a copy). The `*` prefix means "follow the reference to get the actual value":
 
 ```rust
-ctx.shared.encoder_time_diff.lock(|diff| *diff = time_diff);
-//                                         ^ write through the reference
+ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
+//                                               ^ write through the reference
 ```
 
-Think of `diff` as a pointer in C, or a MATLAB `handle` object — `*diff` reaches the value it points to.
+Think of `setpoint` as a pointer in C, or a MATLAB `handle` object — `*setpoint` reaches the value it points to.
 
 ### Macros — the `!` suffix
 
@@ -258,10 +307,10 @@ In this project, `#[task(...)]` is an RTIC attribute. It registers the function 
 Without this attribute, the function is just a normal Rust function and RTIC will not schedule it.
 
 ```rust
-#[allow(unsafe_code)]
+#![deny(unsafe_code)]
 ```
 
-This attribute relaxes a lint rule for the next item (or module/crate scope, depending where it is written). It means: "unsafe code is allowed here." In this codebase, it is used for a few low-level hardware setup parts where `unsafe` is unavoidable.
+This crate defaults to rejecting `unsafe` code. Small, explicitly marked exceptions exist only where the hardware or boot process requires them, such as startup glue and Core 1's SIO ownership handoff.
 
 Why this is useful:
 
@@ -272,7 +321,7 @@ Why this is useful:
 ### `const` — compile-time constants
 
 ```rust
-const SYS_CLOCK_HZ: u32 = 125_000_000;  // like MATLAB's global constants
+const SYS_CLOCK_HZ: u32 = 150_000_000;  // like MATLAB's global constants
 ```
 
 Underscores in numbers are just visual separators (like a thousands comma): `125_000_000` = 125000000.
@@ -295,10 +344,23 @@ async fn toggle_led(...) -> ! {
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | All application logic — tasks, hardware setup, command parsing |
+| `src/main.rs` | Core 0 RTIC app: hardware setup, USB commands, PWM output, encoder interrupts |
+| `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlEvent`) and `FifoChannel` |
+| `src/controller_processor/controller_processor_loop.rs` | Core 1 event loop: receives sensor events, runs EKF + controller, sends PWM commands back |
+| `src/controller_processor/kalman_filter.rs` | Event-driven extended Kalman filter for dead reckoning and speed estimation |
+| `src/controller_processor/controller.rs` | Straight-line speed controller (PID-like) producing servo PWM commands |
 | `src/usb_serial.rs` | USB serial port initialisation (boilerplate, rarely needs changing) |
 | `src/entry.rs` | Low-level chip setup (spinlocks, FPU) — do not touch |
 | `src/lib.rs` | Declares the modules above |
+| `CONTROL_THEORY.md` | Explanation of the estimator and controller math |
 | `memory.x` | Tells the linker where Flash and RAM are on the chip |
 | `Cargo.toml` | Rust's equivalent of a package list (`requirements.txt` / `pip install`) |
 | `build.rs` | Runs at compile time; passes `memory.x` to the linker |
+
+---
+
+## Where To Read Next
+
+- If you want the runtime walkthrough, stay in this file.
+- If you want the math and controls background, read `CONTROL_THEORY.md`.
+- If you want the exact message format between cores, read `src/ipc.rs`.

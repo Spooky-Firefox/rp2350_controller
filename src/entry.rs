@@ -1,12 +1,19 @@
 #![allow(unsafe_code)]
 
+/// Bootstrap hardware before main() runs.
+///
 /// # Safety
-/// this is a copy of what hal::entry does, so do not use this except in the beginning of the program
+/// This is a copy of what hal::entry does. Call only once at bootup before threads start.
+/// Uses raw pointers to hardware registers (spinlocks, co-processor config) that must be
+/// initialized before any Rust code runs. Caller guarantees single-threaded init context.
 pub unsafe fn entry() {
     const SIO_BASE: u32 = 0xd0000000;
     const SPINLOCK0_PTR: *mut u32 = (SIO_BASE + 0x100) as *mut u32;
     const SPINLOCK_COUNT: usize = 32;
     for i in 0..SPINLOCK_COUNT {
+        // Reset all spinlocks via raw pointer write. Safe because: (1) addresses are correct
+        // in RP2350 memory map, (2) writing to spinlock registers is idempotent, (3) we're
+        // in single-threaded init context.
         unsafe { SPINLOCK0_PTR.wrapping_add(i).write_volatile(1) };
     }
     #[cfg(target_arch = "arm")]
@@ -25,6 +32,9 @@ pub unsafe fn entry() {
         {
             temp |= SCB_CPACR_FULL_ACCESS << (0 * 2);
         }
+        // Configure CPACR to allow DCP and GPIO co-processor access. Safe because:
+        // (1) CPACR address is correct for Cortex-M33, (2) register is meant for this config,
+        // (3) we're in single-threaded init context.
         unsafe { SCB_CPACR_PTR.write_volatile(temp) };
         // Don't allow any DCP code to be moved before this fence.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);

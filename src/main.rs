@@ -80,7 +80,9 @@ mod app {
 
     #[init(local = [usb_bus: Option<UsbBusAllocator<MyUsbBus>> = None])]
     fn init(ctx: init::Context) -> (Shared, Local) {
-        // do init stuff that are in hal::entry but left out when using rtic which uses the cortex-m-rt entry point.
+        // Perform early hardware setup (spinlocks, co-processor enable).
+        // This calls entry::entry() which is a copy of hal::entry().
+        // Safe because we're in single-threaded init context and this must run early.
         #[allow(unsafe_code)]
         unsafe {
             entry()
@@ -148,8 +150,9 @@ mod app {
             let cores = mc.cores();
             let core1 = &mut cores[1];
             let stack;
-            // Note that the stack is implemented with a critical section to safely take the mutable static.
-            // So this is safe even in a concurrent context
+            // Taking from a static mutable is unsafe, but wrapped in a critical section.
+            // RTIC's internals protect this with a spinlock, making concurrent access safe.
+            // This is the standard pattern for handing stacks to spawn tasks in RTIC.
             #[allow(unsafe_code, static_mut_refs)]
             unsafe {
                 stack = CORE1_STACK.take().unwrap();

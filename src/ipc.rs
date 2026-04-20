@@ -1,4 +1,5 @@
 //! Inter-core communication types and SIO FIFO primitives.
+#![deny(unsafe_code)]
 //!
 //! # SensorEvent (Core 0 → Core 1): 6 × 32-bit FIFO words
 //!

@@ -1,3 +1,6 @@
+//! USB serial initialization and communication.
+#![deny(unsafe_code)]
+
 use rp235x_hal::{clocks::UsbClock, pac, usb::UsbBus};
 use usb_device::{
     class_prelude::UsbBusAllocator,

@@ -8,6 +8,7 @@
 //! - `theta`   : heading [rad]  (0 = +X, CCW positive)
 //! - `v`       : longitudinal speed [m/s]  (+ forward)
 //!
+#![deny(unsafe_code)]
 //! # API
 //! | Function | When to call | What it does |
 //! |---|---|---|

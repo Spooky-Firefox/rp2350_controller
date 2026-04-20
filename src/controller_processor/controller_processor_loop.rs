@@ -1,3 +1,6 @@
+//! Core 1 event loop for sensor processing and control.
+#![deny(unsafe_code)]
+
 use crate::controller_processor::controller::{Controller, StraightLineSpeedController};
 use crate::controller_processor::kalman_filter;
 use crate::ipc::{self, ControlEvent, SensorEvent, TimeExtender};
@@ -11,9 +14,14 @@ const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 
 /// Entry point for Core 1.  Called from the RTIC `init` on Core 0 via
 /// `core.spawn(...)`.  Runs a blocking event loop that never returns.
+///
+/// This module does not deny unsafe, as it must steal the PAC SIO peripheral.
 pub fn core1_task() -> ! {
-    // Core 1 gets its own SIO handle. steal() is the standard pattern for
-    // Core 1 on RP2350 — SIO is per-core hardware, so each core owns its view.
+    // Core 1 steals the PAC peripheral (Peripherals::steal()). This is the standard
+    // pattern on RP2350 because SIO is per-core hardware: each core has its own SIO view.
+    // Safe because: (1) PAC prevents multi-core data races (SIO regs are not shared),
+    // (2) Core 0 doesn't access SIO (uses HAL singletons), (3) Core 1 accesses only its
+    // own SIO address space, mapped by the hardware to the executing core.
     #[allow(unsafe_code)]
     let sio = hal::Sio::new(unsafe { rp235x_pac::Peripherals::steal() }.SIO);
     let mut channel = ipc::FifoChannel::new(sio.fifo);

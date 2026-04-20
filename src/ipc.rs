@@ -21,7 +21,7 @@
 //! |------|---------|
 //! | 0    | `[steer_pwm_us: u16 | power_pwm_us: u16]` |
 
-use rp235x_pac as pac;
+use rp235x_hal::sio::SioFifo;
 
 /// Sensor event packed as 6 × u32 words for SIO FIFO transfer.
 #[derive(Clone, Copy, Debug)]
@@ -35,7 +35,12 @@ pub struct SensorEvent {
 }
 
 impl SensorEvent {
-    pub fn rpm_and_steer(timestamp_us: u64, setpoint_mps: f32, steer: f32, rpm_period_us: f32) -> Self {
+    pub fn rpm_and_steer(
+        timestamp_us: u64,
+        setpoint_mps: f32,
+        steer: f32,
+        rpm_period_us: f32,
+    ) -> Self {
         Self {
             t32_us: timestamp_us as u32,
             setpoint_mps,
@@ -146,78 +151,63 @@ impl TimeExtender {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Raw SIO FIFO access (hardware routes based on executing core)
+// Owned SIO FIFO channel (no unsafe, uses rp235x-hal)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// RX FIFO has at least one word available.
-#[inline]
-pub fn fifo_has_data() -> bool {
-    let sio = unsafe { &*pac::SIO::ptr() };
-    sio.fifo_st().read().vld().bit_is_set()
+/// Owns the SIO FIFO and provides typed inter-core message passing.
+///
+/// Hardware routes reads/writes based on the executing core, so each core
+/// constructs its own `FifoChannel` from its `SioFifo` handle.
+pub struct FifoChannel {
+    fifo: SioFifo,
+    rx_buf: [u32; 6],
+    rx_count: usize,
 }
 
-/// TX FIFO has space for at least one word.
-#[inline]
-fn fifo_has_space() -> bool {
-    let sio = unsafe { &*pac::SIO::ptr() };
-    sio.fifo_st().read().rdy().bit_is_set()
-}
-
-/// Write one word to the TX FIFO (blocks until space available, then SEV).
-pub fn fifo_write_blocking(val: u32) {
-    while !fifo_has_space() {
-        cortex_m::asm::nop();
-    }
-    let sio = unsafe { &*pac::SIO::ptr() };
-    sio.fifo_wr().write(|w| unsafe { w.bits(val) });
-    cortex_m::asm::sev();
-}
-
-/// Read one word from the RX FIFO (non-blocking).
-pub fn fifo_read() -> Option<u32> {
-    if !fifo_has_data() {
-        return None;
-    }
-    let sio = unsafe { &*pac::SIO::ptr() };
-    Some(sio.fifo_rd().read().bits())
-}
-
-/// Discard all data currently in the RX FIFO.
-pub fn fifo_drain() {
-    while fifo_has_data() {
-        let _ = fifo_read();
-    }
-}
-
-/// Send a complete [`SensorEvent`] (6 blocking writes).
-pub fn send_sensor_event(event: &SensorEvent) {
-    for &w in &event.to_words() {
-        fifo_write_blocking(w);
-    }
-}
-
-/// Send a complete [`ControlEvent`] (1 blocking write).
-pub fn send_control_event(event: &ControlEvent) {
-    fifo_write_blocking(event.to_word());
-}
-
-/// Accumulate FIFO words into a 6-word buffer.
-/// Returns `Some` when all 6 words have been collected (and resets `count`).
-pub fn try_recv_sensor_event(buf: &mut [u32; 6], count: &mut usize) -> Option<SensorEvent> {
-    while *count < 6 {
-        match fifo_read() {
-            Some(w) => {
-                buf[*count] = w;
-                *count += 1;
-            }
-            None => return None,
+impl FifoChannel {
+    pub fn new(fifo: SioFifo) -> Self {
+        Self {
+            fifo,
+            rx_buf: [0u32; 6],
+            rx_count: 0,
         }
     }
-    *count = 0;
-    Some(SensorEvent::from_words(*buf))
-}
 
-/// Read one complete control event.
-pub fn try_recv_control_event() -> Option<ControlEvent> {
-    fifo_read().map(ControlEvent::from_word)
+    /// Discard all data currently in the RX FIFO.
+    pub fn drain(&mut self) {
+        self.fifo.drain();
+    }
+
+    /// Send a complete [`SensorEvent`] (6 blocking writes).
+    pub fn send_sensor_event(&mut self, event: &SensorEvent) {
+        for &w in &event.to_words() {
+            self.fifo.write_blocking(w);
+        }
+    }
+
+    /// Send a complete [`ControlEvent`] (1 blocking write).
+    pub fn send_control_event(&mut self, event: &ControlEvent) {
+        self.fifo.write_blocking(event.to_word());
+    }
+
+    /// Accumulate FIFO words into the internal 6-word buffer.
+    /// Returns `Some` when all 6 words have been collected.
+    pub fn try_recv_sensor_event(&mut self) -> Option<SensorEvent> {
+        while self.rx_count < 6 {
+            match self.fifo.read() {
+                Some(w) => {
+                    self.rx_buf[self.rx_count] = w;
+                    self.rx_count += 1;
+                }
+                None => return None,
+            }
+        }
+        self.rx_count = 0;
+        Some(SensorEvent::from_words(self.rx_buf))
+    }
+
+    /// Read one complete control event (single FIFO word).
+    pub fn try_recv_control_event(&mut self) -> Option<ControlEvent> {
+        self.fifo.read().map(ControlEvent::from_word)
+    }
 }

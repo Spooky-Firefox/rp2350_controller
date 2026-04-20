@@ -216,9 +216,9 @@ impl EkfFilter {
         let f23 = td / l * dt;
 
         // --- Process noise Q (diagonal, scaled by dt²) ---
-        let q0 = (self.c.q_pos * dt) * (self.c.q_pos * dt);     // X, Y
+        let q0 = (self.c.q_pos * dt) * (self.c.q_pos * dt); // X, Y
         let q2 = (self.c.q_theta * dt) * (self.c.q_theta * dt); // theta
-        let q3 = (self.c.q_v * dt) * (self.c.q_v * dt);         // v
+        let q3 = (self.c.q_v * dt) * (self.c.q_v * dt); // v
 
         // --- Covariance update: P = F*P*F' + Q ---
         self.p = fpfT_plus_q(&self.p, f02, f03, f12, f13, f23, q0, q2, q3);
@@ -284,7 +284,12 @@ impl EkfFilter {
 ///   `F[2][3] = f23`
 ///
 /// Q is diagonal: `diag(q0, q0, q2, q3)`.
-#[allow(non_snake_case)]
+#[allow(
+    non_snake_case,
+    clippy::erasing_op,
+    clippy::identity_op,
+    clippy::too_many_arguments
+)]
 fn fpfT_plus_q(
     p: &[f32; 16],
     f02: f32,
@@ -335,6 +340,7 @@ fn fpfT_plus_q(
 ///
 /// `H = [0, 0, 0, dh_dv]` — only index 3 is nonzero, so only column 3 of
 /// `(I-KH)` differs from the identity.
+#[allow(clippy::erasing_op, clippy::identity_op)]
 fn joseph_update(p: &[f32; 16], k: &[f32; 4], dh_dv: f32, r: f32) -> [f32; 16] {
     // Build (I - K*H)
     let mut imkh = [0.0_f32; 16];

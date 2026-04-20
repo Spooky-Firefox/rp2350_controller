@@ -2,7 +2,6 @@
 #![no_main]
 #![deny(unsafe_code)]
 
-
 use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
 use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32};
@@ -16,12 +15,9 @@ use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
 use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
 use usbd_serial::SerialPort;
 
-
 use hal::multicore::Stack;
 // 2^16 = 65536 bytes = 64 KB stack size for core 1 (adjust as needed).
-static  mut CORE1_STACK: Stack<65536> = Stack::new();
-
-
+static mut CORE1_STACK: Stack<65536> = Stack::new();
 
 /// Required by the RP2350 bootrom to identify and validate the image.
 #[allow(unsafe_code)]
@@ -68,6 +64,7 @@ mod app {
         pwm: MotorPwmSlice,
         speed_setpoint_mps: f32,
         last_sensor_irq_us: u64,
+        fifo: ipc::FifoChannel,
     }
 
     #[local]
@@ -146,17 +143,23 @@ mod app {
         encoder.set_interrupt_enabled(rp235x_hal::gpio::Interrupt::EdgeHigh, true);
 
         // Spawn Core 1 for controller processing.
-        #[allow(unsafe_code)]
         {
-            let mut mc =
-                hal::multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+            let mut mc = hal::multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
             let cores = mc.cores();
             let core1 = &mut cores[1];
-            let stack = unsafe { (*(&raw mut CORE1_STACK)).take().unwrap() };
+            let stack;
+            // Note that the stack is implemented with a critical section to safely take the mutable static.
+            // So this is safe even in a concurrent context
+            #[allow(unsafe_code, static_mut_refs)]
+            unsafe {
+                stack = CORE1_STACK.take().unwrap();
+            }
             let _ = core1.spawn(stack, move || {
                 rp2350_controller::controller_processor::controller_processor_loop::core1_task();
             });
         }
+
+        let fifo = ipc::FifoChannel::new(sio.fifo);
 
         MainMono::start(pac.TIMER0, &pac.RESETS);
         toggle_led::spawn().unwrap();
@@ -168,6 +171,7 @@ mod app {
                 pwm,
                 speed_setpoint_mps: 0.0,
                 last_sensor_irq_us: 0,
+                fifo,
             },
             Local {
                 led: onboard_led,
@@ -194,7 +198,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, last_sensor_irq_us], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, last_sensor_irq_us, fifo], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -208,7 +212,9 @@ mod app {
             let now = MainMono::now();
             let previous = *ctx.local.encoder_last_time;
             *ctx.local.encoder_last_time = now;
-            ctx.shared.last_sensor_irq_us.lock(|last| *last = now.ticks());
+            ctx.shared
+                .last_sensor_irq_us
+                .lock(|last| *last = now.ticks());
 
             if previous.ticks() != 0 {
                 let time_diff = now - previous;
@@ -221,7 +227,7 @@ mod app {
                     0.0,
                     time_diff.ticks() as f32,
                 );
-                cortex_m::interrupt::free(|_| ipc::send_sensor_event(&event));
+                ctx.shared.fifo.lock(|fifo| fifo.send_sensor_event(&event));
             }
 
             ctx.local
@@ -230,7 +236,7 @@ mod app {
         }
     }
 
-    #[task(shared = [speed_setpoint_mps, last_sensor_irq_us], priority = 2)]
+    #[task(shared = [speed_setpoint_mps, last_sensor_irq_us, fifo], priority = 2)]
     async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
         loop {
             MainMono::delay(100u64.millis()).await;
@@ -241,17 +247,18 @@ mod app {
             if now.saturating_sub(last_sensor_irq_us) >= 100_000 {
                 let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
                 let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
-                cortex_m::interrupt::free(|_| ipc::send_sensor_event(&event));
+                ctx.shared.fifo.lock(|fifo| fifo.send_sensor_event(&event));
             }
         }
     }
 
     /// Receives control events from Core 1 and applies PWM outputs.
-    #[task(binds = SIO_IRQ_FIFO, shared = [pwm], priority = 2)]
+    #[task(binds = SIO_IRQ_FIFO, shared = [pwm, fifo], priority = 2)]
     fn sio_interrupt(ctx: sio_interrupt::Context) {
         let mut pwm = ctx.shared.pwm;
+        let mut fifo = ctx.shared.fifo;
 
-        while let Some(ctrl) = ipc::try_recv_control_event() {
+        while let Some(ctrl) = fifo.lock(|f| f.try_recv_control_event()) {
             let steer_on = MicrosDurationU32::from_ticks(ctrl.steer_pwm_us as u32).min(PWM_PERIOD);
             let power_on = MicrosDurationU32::from_ticks(ctrl.power_pwm_us as u32).min(PWM_PERIOD);
             pwm.lock(|pwm| {
@@ -341,7 +348,9 @@ mod app {
                 }
             } else if let Some(rest) = command.strip_prefix("speed ") {
                 if let Some(setpoint_mps) = parse_speed_setpoint(rest) {
-                    ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = setpoint_mps);
+                    ctx.shared
+                        .speed_setpoint_mps
+                        .lock(|setpoint| *setpoint = setpoint_mps);
                     info!("Set speed setpoint to {} m/s", setpoint_mps);
 
                     #[cfg(feature = "echo_usb")]

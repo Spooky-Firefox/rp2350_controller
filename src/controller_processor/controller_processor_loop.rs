@@ -4,6 +4,7 @@ use crate::ipc::{self, ControlEvent, SensorEvent, TimeExtender};
 
 use core::f32::consts::PI;
 use fugit::TimerInstantU64;
+use rp235x_hal as hal;
 
 /// Arc length per encoder magnet pulse [m].
 const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
@@ -11,8 +12,14 @@ const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 /// Entry point for Core 1.  Called from the RTIC `init` on Core 0 via
 /// `core.spawn(...)`.  Runs a blocking event loop that never returns.
 pub fn core1_task() -> ! {
+    // Core 1 gets its own SIO handle. steal() is the standard pattern for
+    // Core 1 on RP2350 — SIO is per-core hardware, so each core owns its view.
+    #[allow(unsafe_code)]
+    let sio = hal::Sio::new(unsafe { rp235x_pac::Peripherals::steal() }.SIO);
+    let mut channel = ipc::FifoChannel::new(sio.fifo);
+
     // Drain any stale FIFO data left over from boot / previous run.
-    ipc::fifo_drain();
+    channel.drain();
 
     // ── Kalman filter constants ──────────────────────────────────────────
     let kalman_const = kalman_filter::EkfConst {
@@ -28,10 +35,7 @@ pub fn core1_task() -> ! {
     let x0: [f32; 4] = [0.0; 4];
 
     let p0: [f32; 16] = [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
 
     // ── Controller ───────────────────────────────────────────────────────
@@ -50,16 +54,12 @@ pub fn core1_task() -> ! {
     // Filter is lazily initialised on the first event so that t0 is correct.
     let mut filter: Option<kalman_filter::EkfFilter> = None;
     let mut time_ext = TimeExtender::new();
-
-    // Accumulator for incoming 5-word sensor events.
-    let mut rx_buf = [0u32; 6];
-    let mut rx_count: usize = 0;
     let mut last_control_time_us: Option<u64> = None;
     let mut last_setpoint_bits = f32::INFINITY.to_bits();
 
     // ── Main event loop ──────────────────────────────────────────────────
     loop {
-        if let Some(event) = ipc::try_recv_sensor_event(&mut rx_buf, &mut rx_count) {
+        if let Some(event) = channel.try_recv_sensor_event() {
             let t_us = time_ext.extend(event.t32_us);
             let now = TimerInstantU64::<1_000_000>::from_ticks(t_us);
             let dt_s = last_control_time_us
@@ -73,16 +73,15 @@ pub fn core1_task() -> ! {
             }
 
             // Lazy-init filter on first event.
-            let filt = filter.get_or_insert_with(|| {
-                kalman_filter::EkfFilter::new(kalman_const, x0, p0, now)
-            });
+            let filt = filter
+                .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
 
             process_event(filt, &event, now);
 
             // Run the controller and send result back to Core 0.
             let [steer_pwm, power_pwm] = controller.update(filt.speed(), dt_s);
 
-            ipc::send_control_event(&ControlEvent::new(steer_pwm, power_pwm));
+            channel.send_control_event(&ControlEvent::new(steer_pwm, power_pwm));
         } else {
             // No data available — sleep until the other core signals via SEV.
             cortex_m::asm::wfe();

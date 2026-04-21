@@ -9,7 +9,8 @@ pub struct StraightLineSpeedController {
     pub kp: f32,
     pub ki: f32,
     pub kd: f32,
-    pub speed_setpoint_mps: f32,
+    pub distance_setpoint_m: f32,
+    pub measured_distance_m: f32,
     pub integral_error: f32,
     pub previous_error: f32,
     pub integral_limit: f32,
@@ -24,10 +25,17 @@ pub struct StraightLineSpeedController {
 
 impl Controller for StraightLineSpeedController {
     fn update(&mut self, speed_mps: f32, dt_s: f32) -> [u16; 2] {
-        let error = self.speed_setpoint_mps - speed_mps;
+        if dt_s > 0.0 {
+            self.measured_distance_m += speed_mps.abs() * dt_s;
+        }
+
+        let error = self.distance_setpoint_m - self.measured_distance_m;
         warn!(
-            "Speed: {} m/s, Setpoint: {} m/s, Error: {} m/s",
-            speed_mps, self.speed_setpoint_mps, error
+            "Speed: {} m/s, Distance: {} m, Setpoint: {} m, Error: {} m",
+            speed_mps,
+            self.measured_distance_m,
+            self.distance_setpoint_m,
+            error
         );
         if dt_s > 0.0 {
             self.integral_error += error * dt_s;
@@ -52,12 +60,12 @@ impl Controller for StraightLineSpeedController {
             + self.last_proportional
             + self.last_integral
             + self.last_derivative)
-            .clamp(1200.0, 1800.0) as u16;
+            .clamp(1500.0, 2000.0) as u16;
 
         [self.steering_pwm_us, power_pwm]
     }
 
     fn set_speed_setpoint(&mut self, setpoint_mps: f32) {
-        self.speed_setpoint_mps = setpoint_mps;
+        self.distance_setpoint_m = setpoint_mps;
     }
 }

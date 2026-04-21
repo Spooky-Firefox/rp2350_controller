@@ -6,14 +6,21 @@ use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
 use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32};
 use hal::gpio;
+use heapless::String;
 use panic_probe as _;
 use rp235x_hal as hal;
 use rp235x_pac as pac;
 use rp2350_controller::entry::entry;
 use rp2350_controller::ipc;
 use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
-use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
+use usb_device::{
+    class_prelude::UsbBusAllocator,
+    device::{UsbDevice, UsbDeviceState},
+};
 use usbd_serial::SerialPort;
+
+use core::f32::consts::PI;
+use core::fmt::Write as _;
 
 use hal::multicore::Stack;
 // 2^16 = 65536 bytes = 64 KB stack size for core 1 (adjust as needed).
@@ -32,6 +39,9 @@ const SYS_CLOCK_HZ: u32 = 150_000_000;
 const PWM_DIV_INT: u8 = 64;
 const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / PWM_DIV_INT as u32;
 
+/// Arc length per encoder pulse [m].
+const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 13.0 * PI / 300.0;
+
 // Standard RC-servo frame period (50 Hz).
 const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);
 const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_500);
@@ -40,7 +50,7 @@ const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_5
 type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
 
 // Shorthand for GPIO13 configured as a digital input with pull-up (encoder pin).
-type EncoderPin = gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
+type EncoderPin = gpio::Pin<gpio::bank0::Gpio18, gpio::FunctionSioInput, gpio::PullUp>;
 
 type MotorPwmSlice = hal::pwm::Slice<hal::pwm::Pwm0, hal::pwm::FreeRunning>;
 
@@ -50,7 +60,9 @@ type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio17, gpio::FunctionPwm, gpio::Pull
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0, DMA_IRQ_1])]
 mod app {
 
-    use defmt::{info, trace};
+    use core::task;
+
+    use defmt::{debug, info, trace, warn};
     use embedded_hal::pwm::SetDutyCycle;
     use fugit::{MicrosDurationU32, TimerInstantU64};
     use rtic_monotonics::Monotonic;
@@ -63,6 +75,7 @@ mod app {
         serial: SerialPort<'static, MyUsbBus>,
         pwm: MotorPwmSlice,
         speed_setpoint_mps: f32,
+        measured_speed_mps: f32,
         last_sensor_irq_us: u64,
         fifo: ipc::FifoChannel,
     }
@@ -141,7 +154,7 @@ mod app {
         pwm.channel_b.set_enabled(true);
 
         // Configure encoder input and enable interrupt on rising edges (magnet passes sensor).
-        let encoder = pins.gpio13.into_pull_up_input();
+        let encoder = pins.gpio18.into_pull_up_input();
         encoder.set_interrupt_enabled(rp235x_hal::gpio::Interrupt::EdgeHigh, true);
 
         // Spawn Core 1 for controller processing.
@@ -163,16 +176,19 @@ mod app {
         }
 
         let fifo = ipc::FifoChannel::new(sio.fifo);
+        delay_update_setpoint::spawn().unwrap();
 
         MainMono::start(pac.TIMER0, &pac.RESETS);
         toggle_led::spawn().unwrap();
         sensor_timeout::spawn().unwrap();
+        log_speed::spawn().unwrap();
         (
             Shared {
                 usb_dev,
                 serial,
                 pwm,
                 speed_setpoint_mps: 0.0,
+                measured_speed_mps: 0.0,
                 last_sensor_irq_us: 0,
                 fifo,
             },
@@ -193,15 +209,25 @@ mod app {
         }
     }
 
+    #[task(shared = [speed_setpoint_mps], priority = 1)]
+    async fn delay_update_setpoint(mut ctx: delay_update_setpoint::Context) -> ! {
+        loop {
+            MainMono::delay(10.secs()).await;
+            ctx.shared
+                .speed_setpoint_mps
+                .lock(|setpoint| *setpoint = if *setpoint == 0.0 { 1.0 } else { 0.0 });
+        }
+    }
+
     #[task(local = [led], priority = 1)]
     async fn toggle_led(ctx: toggle_led::Context) -> ! {
         loop {
-            MainMono::delay(1u64.secs()).await;
+            MainMono::delay(250u64.millis()).await;
             ctx.local.led.toggle().unwrap();
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, last_sensor_irq_us, fifo], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -210,7 +236,7 @@ mod app {
             .encoder
             .interrupt_status(hal::gpio::Interrupt::EdgeHigh)
         {
-            trace!("encoder edge high cnt {}", ctx.local.cnt);
+            trace!("encoder edge cnt {}", ctx.local.cnt);
 
             let now = MainMono::now();
             let previous = *ctx.local.encoder_last_time;
@@ -222,6 +248,11 @@ mod app {
             if previous.ticks() != 0 {
                 let time_diff = now - previous;
                 let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
+                let measured_speed_mps =
+                    LENGTH_PER_ENCODER_PULSE_METERS / (time_diff.ticks() as f32 * 1e-6);
+                ctx.shared
+                    .measured_speed_mps
+                    .lock(|speed| *speed = measured_speed_mps);
 
                 // Steering is stubbed to 0.0 for now.
                 let event = ipc::SensorEvent::rpm_and_steer(
@@ -239,7 +270,7 @@ mod app {
         }
     }
 
-    #[task(shared = [speed_setpoint_mps, last_sensor_irq_us, fifo], priority = 2)]
+    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo], priority = 2)]
     async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
         loop {
             MainMono::delay(100u64.millis()).await;
@@ -249,9 +280,50 @@ mod app {
 
             if now.saturating_sub(last_sensor_irq_us) >= 100_000 {
                 let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
+                ctx.shared.measured_speed_mps.lock(|speed| *speed = 0.0);
                 let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
                 ctx.shared.fifo.lock(|fifo| fifo.send_sensor_event(&event));
             }
+        }
+    }
+
+    /// Periodic telemetry logging hook. Easy place to later mirror data to USB serial.
+    #[task(shared = [usb_dev, serial, speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us], priority = 1)]
+    async fn log_speed(mut ctx: log_speed::Context) -> ! {
+        loop {
+            MainMono::delay(250u64.millis()).await;
+
+            let now_us = MainMono::now().ticks();
+            let setpoint = ctx.shared.speed_setpoint_mps.lock(|v| *v);
+            let speed = ctx.shared.measured_speed_mps.lock(|v| *v);
+            let age_us = ctx
+                .shared
+                .last_sensor_irq_us
+                .lock(|last| now_us.saturating_sub(*last));
+
+            info!(
+                "speed: measured={} m/s setpoint={} m/s age={} us",
+                speed, setpoint, age_us
+            );
+
+            // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
+            let mut line: String<96> = String::new();
+            let _ = write!(
+                &mut line,
+                ">speed_mps:{:.4},setpoint_mps:{:.4},age_us:{}\r\n",
+                speed, setpoint, age_us
+            );
+
+            (&mut ctx.shared.usb_dev, &mut ctx.shared.serial).lock(|usb_dev, serial| {
+                // Only emit plot data when the device is configured and host has opened the port.
+                if usb_dev.state() == UsbDeviceState::Configured && serial.dtr() {
+                    let _ = usb_dev.poll(&mut [serial]);
+                    let r = serial.write(line.as_bytes());
+                    if let Err(e) = r {
+                        warn!("USB serial write error: {:?}", defmt::Debug2Format(&e));
+                    }
+                }
+            });
         }
     }
 
@@ -268,7 +340,7 @@ mod app {
                 let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
                 let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
             });
-            info!(
+            trace!(
                 "ctrl: steer={} us  power={} us",
                 ctrl.steer_pwm_us, ctrl.power_pwm_us
             );

@@ -21,6 +21,7 @@
 //! of whether RPM is faster or slower than any fixed tick rate.
 
 use core::f32::consts::PI;
+use defmt::debug;
 use fugit::TimerInstantU64;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,7 +221,7 @@ impl EkfFilter {
         let q0 = (self.c.q_pos * dt) * (self.c.q_pos * dt); // X, Y
         let q2 = (self.c.q_theta * dt) * (self.c.q_theta * dt); // theta
         let q3 = (self.c.q_v * dt) * (self.c.q_v * dt); // v
-
+        debug!("x {}", self.x);
         // --- Covariance update: P = F*P*F' + Q ---
         self.p = fpfT_plus_q(&self.p, f02, f03, f12, f13, f23, q0, q2, q3);
     }
@@ -229,6 +230,7 @@ impl EkfFilter {
     ///
     /// Measurement model: `z = |v| + noise`.
     fn update_speed(&mut self, speed_meas: f32) {
+        debug!("speed_meas {}", speed_meas);
         let v = self.x[3];
         let eps = self.c.eps_v;
 

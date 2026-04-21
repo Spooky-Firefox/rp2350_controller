@@ -33,13 +33,11 @@ impl Controller for StraightLineSpeedController {
         };
         self.previous_error = error;
 
-        let power_pwm = (
-            self.neutral_power_pwm_us as f32
-                + self.kp * error
-                + self.ki * self.integral_error
-                + self.kd * derivative
-        )
-            .clamp(1000.0, 2000.0) as u16;
+        let power_pwm = (self.neutral_power_pwm_us as f32
+            + self.kp * error
+            + self.ki * self.integral_error
+            + self.kd * derivative)
+            .clamp(1200.0, 1800.0) as u16;
 
         [self.steering_pwm_us, power_pwm]
     }

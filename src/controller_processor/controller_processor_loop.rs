@@ -48,10 +48,10 @@ pub fn core1_task() -> ! {
 
     // ── Controller ───────────────────────────────────────────────────────
     let mut controller = StraightLineSpeedController {
-        kp: 1.0,
+        kp: 100.0,
         ki: 0.0,
         kd: 0.0,
-        speed_setpoint_mps: 0.0,
+        speed_setpoint_mps: 0.5,
         integral_error: 0.0,
         previous_error: 0.0,
         integral_limit: 50.0,
@@ -85,9 +85,9 @@ pub fn core1_task() -> ! {
                 .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
 
             process_event(filt, &event, now);
-
+            let speed = LENGTH_PER_HAL_RISE_METERS / event.values[1]; // Convert encoder period → speed for controller input.
             // Run the controller and send result back to Core 0.
-            let [steer_pwm, power_pwm] = controller.update(filt.speed(), dt_s);
+            let [steer_pwm, power_pwm] = controller.update(speed, dt_s);
 
             channel.send_control_event(&ControlEvent::new(steer_pwm, power_pwm));
         } else {

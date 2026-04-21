@@ -19,6 +19,7 @@ fugit = "0.3.9"
 libm = "0.2"
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
+heapless = "0.8"
 
 [features]
 default = ["echo_usb"]

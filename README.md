@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD041 -->
 ```text
  ___ ___ ___ _______  __     ___         _           _ _
 | _ \ _ \_  )__ / __|/  \   / __|___ _ _| |_ _ _ ___| | |___ _ _
@@ -61,21 +62,24 @@ By default, debug output goes to the RTT (Real-Time Transfer) probe connected vi
 
 Control the verbosity of embedded logs via the `DEFMT_LOG` environment variable:
 
-#### Maximum detail (trace level):
+#### Maximum detail (trace level)
+
 ```sh
 DEFMT_LOG=trace cargo run --release
 ```
 
 Shows every function entry, loop iteration, and state update. Useful for deep debugging but generates a lot of output.
 
-#### Warnings and errors only (warn level):
+#### Warnings and errors only (warn level)
+
 ```sh
 DEFMT_LOG=warn cargo run --release
 ```
 
 Filters to only critical issues and status warnings. Less spammy for production-like testing.
 
-#### Other levels:
+#### Other levels
+
 - `DEFMT_LOG=debug`: typical debugging output
 - `DEFMT_LOG=info`: high-level runtime events (default)
 - `DEFMT_LOG=error`: errors only

@@ -84,7 +84,7 @@ pub struct EkfFilter {
 }
 
 impl EkfFilter {
-    /// Initialise the filter.
+    /// Initialize the filter.
     ///
     /// - `c`  : tuning constants
     /// - `x0` : initial state `[X, Y, theta, v]`

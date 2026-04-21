@@ -31,7 +31,7 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 ### Tasks
 
 | Task | Trigger | What it does |
-|------|---------|--------------|
+| ------ | ------- | ------------ |
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
 | `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
@@ -66,7 +66,7 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
 The two cores talk through a **32-bit hardware FIFO** built into the RP2350's SIO peripheral. Each core has its own TX and RX side — data written by one core appears on the other's read side.
 
 | Direction | Message | Size | Content |
-|-----------|---------|------|---------|
+| --------- | ------- | ---- | ------- |
 | Core 0 → Core 1 | `SensorEvent` | 6 words | timestamp, speed setpoint, steering, encoder period |
 | Core 1 → Core 0 | `ControlEvent` | 1 word | steering PWM + power PWM packed into 16 bits each |
 
@@ -109,12 +109,12 @@ Where $d$ is the distance one magnet-spacing represents (`13 × π / 300` meters
 
 ## USB Serial — Sending Commands
 
-The microcontroller appears as a **virtual serial port** on the PC. You can use any serial terminal (e.g. PuTTY, screen, minicom) at any baud rate.
+The microcontroller appears as a **virtual serial port** on the PC. You can use any serial terminal (e.g. PuTTY, screen, tio, minicom) at any baud rate.
 
 ### Commands
 
 | Command | Example | Effect |
-|---------|---------|--------|
+| ------- | ------- | ------ |
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
 | `speed <m/s>` | `speed 1.2` | Set the speed controller target to 1.2 m/s |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
@@ -247,7 +247,7 @@ if let Some(on_time_us) = parse_on_time_us(rest) {
 let clocks = init_clocks_and_plls(...).unwrap();
 ```
 
-`Result<T, E>` is either `Ok(value)` or `Err(error)` — like a function that either succeeds or returns an error. `.unwrap()` takes the success value or panics. In production code you'd handle the error; here `.unwrap()` is acceptable because a clock initialisation failure means the hardware is broken.
+`Result<T, E>` is either `Ok(value)` or `Err(error)` — like a function that either succeeds or returns an error. `.unwrap()` takes the success value or panics. In production code you'd handle the error; here `.unwrap()` is acceptable because a clock initialization failure means the hardware is broken.
 
 ### References and `*` (dereferencing)
 
@@ -343,13 +343,13 @@ async fn toggle_led(...) -> ! {
 ## File Overview
 
 | File | Purpose |
-|------|---------|
+| ---- | ------- |
 | `src/main.rs` | Core 0 RTIC app: hardware setup, USB commands, PWM output, encoder interrupts |
 | `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlEvent`) and `FifoChannel` |
 | `src/controller_processor/controller_processor_loop.rs` | Core 1 event loop: receives sensor events, runs EKF + controller, sends PWM commands back |
 | `src/controller_processor/kalman_filter.rs` | Event-driven extended Kalman filter for dead reckoning and speed estimation |
 | `src/controller_processor/controller.rs` | Straight-line speed controller (PID-like) producing servo PWM commands |
-| `src/usb_serial.rs` | USB serial port initialisation (boilerplate, rarely needs changing) |
+| `src/usb_serial.rs` | USB serial port initialization (boilerplate, rarely needs changing) |
 | `src/entry.rs` | Low-level chip setup (spinlocks, FPU) — do not touch |
 | `src/lib.rs` | Declares the modules above |
 | `CONTROL_THEORY.md` | Explanation of the estimator and controller math |

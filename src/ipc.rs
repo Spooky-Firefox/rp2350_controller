@@ -151,6 +151,12 @@ impl TimeExtender {
     }
 }
 
+impl Default for TimeExtender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Owned SIO FIFO channel (no unsafe, uses rp235x-hal)
 // ─────────────────────────────────────────────────────────────────────────────

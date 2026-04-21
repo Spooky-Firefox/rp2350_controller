@@ -257,11 +257,14 @@ impl EkfFilter {
         // Kalman gain K = P*H' / S  (4×1)
         //   (P*H')[i] = P[i][3] * dh_dv
         let mut k = [0.0_f32; 4];
+        // TODO can we change this? or is it standard to write when doing controller math?
+        #[allow(clippy::needless_range_loop)]
         for i in 0..4 {
             k[i] = self.p[i * 4 + 3] * dh_dv / s;
         }
 
         // State update: x += K * y_inn
+        #[allow(clippy::needless_range_loop)]
         for i in 0..4 {
             self.x[i] += k[i] * y_inn;
         }

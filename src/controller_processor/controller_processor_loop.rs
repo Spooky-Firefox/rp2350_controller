@@ -51,7 +51,8 @@ pub fn core1_task() -> ! {
         kp: 75.0,
         ki: 5.0,
         kd: 0.0,
-        speed_setpoint_mps: 0.5,
+        distance_setpoint_m: 0.5,
+        measured_distance_m: 0.0,
         integral_error: 0.0,
         previous_error: 0.0,
         integral_limit: 50.0,
@@ -89,7 +90,11 @@ pub fn core1_task() -> ! {
                 .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
 
             process_event(filt, &event, now);
-            let speed = LENGTH_PER_HAL_RISE_METERS / (event.values[1] * 1e-6); // Convert encoder period → speed for controller input.
+            let speed = if event.values[1].is_finite() && event.values[1] > 0.0 {
+                LENGTH_PER_HAL_RISE_METERS / (event.values[1] * 1e-6)
+            } else {
+                0.0
+            };
             // Run the controller and send result back to Core 0.
             let [steer_pwm_us, power_pwm_us] = controller.update(speed, dt_s);
             channel.send_control_event_blocking(&ControlEvent::Pid {

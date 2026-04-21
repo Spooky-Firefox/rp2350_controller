@@ -48,8 +48,8 @@ pub fn core1_task() -> ! {
 
     // ── Controller ───────────────────────────────────────────────────────
     let mut controller = StraightLineSpeedController {
-        kp: 100.0,
-        ki: 0.0,
+        kp: 75.0,
+        ki: 5.0,
         kd: 0.0,
         speed_setpoint_mps: 0.5,
         integral_error: 0.0,
@@ -57,6 +57,10 @@ pub fn core1_task() -> ! {
         integral_limit: 50.0,
         steering_pwm_us: 1500,
         neutral_power_pwm_us: 1500,
+        last_error: 0.0,
+        last_proportional: 0.0,
+        last_integral: 0.0,
+        last_derivative: 0.0,
     };
 
     // Filter is lazily initialised on the first event so that t0 is correct.
@@ -85,11 +89,19 @@ pub fn core1_task() -> ! {
                 .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
 
             process_event(filt, &event, now);
-            let speed = LENGTH_PER_HAL_RISE_METERS / event.values[1]; // Convert encoder period → speed for controller input.
+            let speed = LENGTH_PER_HAL_RISE_METERS / (event.values[1] * 1e-6); // Convert encoder period → speed for controller input.
             // Run the controller and send result back to Core 0.
-            let [steer_pwm, power_pwm] = controller.update(speed, dt_s);
-
-            channel.send_control_event(&ControlEvent::new(steer_pwm, power_pwm));
+            let [steer_pwm_us, power_pwm_us] = controller.update(speed, dt_s);
+            channel.send_control_event_blocking(&ControlEvent::Pid {
+                error: controller.last_error,
+                proportional: controller.last_proportional,
+                integral: controller.last_integral,
+                derivative: controller.last_derivative,
+            });
+            channel.send_control_event_blocking(&ControlEvent::Control {
+                steer_pwm_us,
+                power_pwm_us,
+            });
         } else {
             // No data available — sleep until the other core signals via SEV.
             cortex_m::asm::wfe();

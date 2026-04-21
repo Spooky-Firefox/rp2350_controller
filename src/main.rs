@@ -65,9 +65,17 @@ mod app {
     use defmt::{debug, info, trace, warn};
     use embedded_hal::pwm::SetDutyCycle;
     use fugit::{MicrosDurationU32, TimerInstantU64};
+    use rp2350_controller::controller_processor;
     use rtic_monotonics::Monotonic;
 
     use super::*;
+
+    pub struct PidDbg {
+        pub error: f32,
+        pub proportional: f32,
+        pub integral: f32,
+        pub derivative: f32,
+    }
 
     #[shared]
     struct Shared {
@@ -78,6 +86,8 @@ mod app {
         measured_speed_mps: f32,
         last_sensor_irq_us: u64,
         fifo: ipc::FifoChannel,
+        pid_dbg: PidDbg,
+        power: u16,
     }
 
     #[local]
@@ -181,7 +191,7 @@ mod app {
         MainMono::start(pac.TIMER0, &pac.RESETS);
         toggle_led::spawn().unwrap();
         sensor_timeout::spawn().unwrap();
-        log_speed::spawn().unwrap();
+        log_data::spawn().unwrap();
         (
             Shared {
                 usb_dev,
@@ -191,6 +201,13 @@ mod app {
                 measured_speed_mps: 0.0,
                 last_sensor_irq_us: 0,
                 fifo,
+                pid_dbg: PidDbg {
+                    error: 0.0,
+                    proportional: 0.0,
+                    integral: 0.0,
+                    derivative: 0.0,
+                },
+                power: 0,
             },
             Local {
                 led: onboard_led,
@@ -215,7 +232,7 @@ mod app {
             MainMono::delay(10.secs()).await;
             ctx.shared
                 .speed_setpoint_mps
-                .lock(|setpoint| *setpoint = if *setpoint == 0.0 { 1.0 } else { 0.0 });
+                .lock(|setpoint| *setpoint = if *setpoint == 0.0 { 10.0 } else { 0.0 });
         }
     }
 
@@ -288,8 +305,8 @@ mod app {
     }
 
     /// Periodic telemetry logging hook. Easy place to later mirror data to USB serial.
-    #[task(shared = [usb_dev, serial, speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us], priority = 1)]
-    async fn log_speed(mut ctx: log_speed::Context) -> ! {
+    #[task(shared = [usb_dev, serial, speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, pid_dbg, power], priority = 1)]
+    async fn log_data(mut ctx: log_data::Context) -> ! {
         loop {
             MainMono::delay(250u64.millis()).await;
 
@@ -306,12 +323,30 @@ mod app {
                 speed, setpoint, age_us
             );
 
+            let PidDbg {
+                error,
+                proportional,
+                integral,
+                derivative,
+            } = ctx.shared.pid_dbg.lock(|dbg| PidDbg {
+                error: dbg.error,
+                proportional: dbg.proportional,
+                integral: dbg.integral,
+                derivative: dbg.derivative,
+            });
+
             // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
-            let mut line: String<96> = String::new();
+            let mut line: String<512> = String::new();
             let _ = write!(
                 &mut line,
-                ">speed_mps:{:.4},setpoint_mps:{:.4},age_us:{}\r\n",
-                speed, setpoint, age_us
+                ">speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, P:{:.4}, I:{:.4}, D:{:.4}, power:{}\r\n",
+                speed,
+                setpoint,
+                error,
+                proportional,
+                integral,
+                derivative,
+                ctx.shared.power.lock(|p| *p)
             );
 
             (&mut ctx.shared.usb_dev, &mut ctx.shared.serial).lock(|usb_dev, serial| {
@@ -328,22 +363,51 @@ mod app {
     }
 
     /// Receives control events from Core 1 and applies PWM outputs.
-    #[task(binds = SIO_IRQ_FIFO, shared = [pwm, fifo], priority = 2)]
+    #[task(binds = SIO_IRQ_FIFO, shared = [pwm, fifo, pid_dbg, power], priority = 2)]
     fn sio_interrupt(ctx: sio_interrupt::Context) {
         let mut pwm = ctx.shared.pwm;
         let mut fifo = ctx.shared.fifo;
+        let mut pid_dbg = ctx.shared.pid_dbg;
+        let mut power = ctx.shared.power;
+        while fifo.lock(|f| f.have_data()) {
+            match fifo.lock(ipc::ControlEvent::from_fifo_chanel_blocking) {
+                ipc::ControlEvent::Control {
+                    steer_pwm_us,
+                    power_pwm_us,
+                } => {
+                    let steer_on =
+                        MicrosDurationU32::from_ticks(steer_pwm_us as u32).min(PWM_PERIOD);
+                    let power_on =
+                        MicrosDurationU32::from_ticks(power_pwm_us as u32).min(PWM_PERIOD);
 
-        while let Some(ctrl) = fifo.lock(|f| f.try_recv_control_event()) {
-            let steer_on = MicrosDurationU32::from_ticks(ctrl.steer_pwm_us as u32).min(PWM_PERIOD);
-            let power_on = MicrosDurationU32::from_ticks(ctrl.power_pwm_us as u32).min(PWM_PERIOD);
-            pwm.lock(|pwm| {
-                let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
-                let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
-            });
-            trace!(
-                "ctrl: steer={} us  power={} us",
-                ctrl.steer_pwm_us, ctrl.power_pwm_us
-            );
+                    pwm.lock(|pwm| {
+                        let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
+                        let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+                    });
+                    power.lock(|p| *p = power_pwm_us);
+                    trace!("ctrl: steer={} us  power={} us", steer_pwm_us, power_pwm_us);
+                }
+                ipc::ControlEvent::Pid {
+                    error,
+                    proportional,
+                    integral,
+                    derivative,
+                } => {
+                    pid_dbg.lock(|dbg| {
+                        dbg.error = error;
+                        dbg.proportional = proportional;
+                        dbg.integral = integral;
+                        dbg.derivative = derivative;
+                    });
+                    trace!(
+                        "pid: error={} P={} I={} D={}",
+                        error, proportional, integral, derivative
+                    );
+                }
+                _ => {
+                    // Ignore other event types for now.
+                }
+            }
         }
     }
 

@@ -86,29 +86,94 @@ impl SensorEvent {
 
 /// Control output from Core 1 → Core 0: two PWM on-times packed into one word.
 #[derive(Clone, Copy, Debug)]
-pub struct ControlEvent {
-    /// Steering servo on-time [µs], typically 1000–2000.
-    pub steer_pwm_us: u16,
-    /// Power/throttle servo on-time [µs], typically 1000–2000.
-    pub power_pwm_us: u16,
+pub enum ControlEvent {
+    // control signal
+    Control {
+        steer_pwm_us: u16,
+        power_pwm_us: u16,
+    },
+    Pid {
+        error: f32,
+        proportional: f32,
+        integral: f32,
+        derivative: f32,
+    },
+    KalmanDebug {
+        x: [f32; 4],
+    },
 }
 
 impl ControlEvent {
-    pub fn new(steer_pwm_us: u16, power_pwm_us: u16) -> Self {
-        Self {
-            steer_pwm_us,
-            power_pwm_us,
+    pub fn to_words(&self) -> heapless::Vec<u32, 6> {
+        match self {
+            ControlEvent::Control {
+                steer_pwm_us,
+                power_pwm_us,
+            } => heapless::Vec::from_slice(&[
+                1,
+                (*steer_pwm_us as u32) << 16 | (*power_pwm_us as u32),
+            ])
+            .unwrap(),
+            ControlEvent::Pid {
+                error,
+                proportional,
+                integral,
+                derivative,
+            } => heapless::Vec::from_slice(&[
+                2,
+                error.to_bits(),
+                proportional.to_bits(),
+                integral.to_bits(),
+                derivative.to_bits(),
+            ])
+            .unwrap(),
+            ControlEvent::KalmanDebug { x } => heapless::Vec::from_slice(&[
+                3,
+                x[0].to_bits(),
+                x[1].to_bits(),
+                x[2].to_bits(),
+                x[3].to_bits(),
+            ])
+            .unwrap(),
         }
     }
 
-    pub fn to_word(&self) -> u32 {
-        ((self.steer_pwm_us as u32) << 16) | (self.power_pwm_us as u32)
-    }
-
-    pub fn from_word(word: u32) -> Self {
-        Self {
-            steer_pwm_us: (word >> 16) as u16,
-            power_pwm_us: word as u16,
+    pub fn from_fifo_chanel_blocking(channel: &mut FifoChannel) -> Self {
+        match channel.fifo.read_blocking() {
+            1 => {
+                let w = channel.fifo.read_blocking();
+                let steer_pwm_us = ((w >> 16) & 0xFF) as u16;
+                let power_pwm_us = (w & 0xFFFF) as u16;
+                return ControlEvent::Control {
+                    steer_pwm_us,
+                    power_pwm_us,
+                };
+            }
+            2 => {
+                let error = f32::from_bits(channel.fifo.read_blocking());
+                let proportional = f32::from_bits(channel.fifo.read_blocking());
+                let integral = f32::from_bits(channel.fifo.read_blocking());
+                let derivative = f32::from_bits(channel.fifo.read_blocking());
+                return ControlEvent::Pid {
+                    error,
+                    proportional,
+                    integral,
+                    derivative,
+                };
+            }
+            3 => {
+                let x0 = f32::from_bits(channel.fifo.read_blocking());
+                let x1 = f32::from_bits(channel.fifo.read_blocking());
+                let x2 = f32::from_bits(channel.fifo.read_blocking());
+                let x3 = f32::from_bits(channel.fifo.read_blocking());
+                return ControlEvent::KalmanDebug {
+                    x: [x0, x1, x2, x3],
+                };
+            }
+            _ => {
+                // Handle unknown event type or error as needed.
+                panic!("Unknown control event type or FIFO read error");
+            }
         }
     }
 }
@@ -179,6 +244,9 @@ impl FifoChannel {
             rx_count: 0,
         }
     }
+    pub fn have_data(&mut self) -> bool {
+        self.fifo.is_read_ready()
+    }
 
     /// Discard all data currently in the RX FIFO.
     pub fn drain(&mut self) {
@@ -193,8 +261,10 @@ impl FifoChannel {
     }
 
     /// Send a complete [`ControlEvent`] (1 blocking write).
-    pub fn send_control_event(&mut self, event: &ControlEvent) {
-        self.fifo.write_blocking(event.to_word());
+    pub fn send_control_event_blocking(&mut self, event: &ControlEvent) {
+        for &w in &event.to_words() {
+            self.fifo.write_blocking(w);
+        }
     }
 
     /// Accumulate FIFO words into the internal 6-word buffer.
@@ -211,10 +281,5 @@ impl FifoChannel {
         }
         self.rx_count = 0;
         Some(SensorEvent::from_words(self.rx_buf))
-    }
-
-    /// Read one complete control event (single FIFO word).
-    pub fn try_recv_control_event(&mut self) -> Option<ControlEvent> {
-        self.fifo.read().map(ControlEvent::from_word)
     }
 }

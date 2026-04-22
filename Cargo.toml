@@ -24,6 +24,7 @@ heapless = "0.8"
 [features]
 default = ["echo_usb"]
 echo_usb = []
+simple_csv = []
 
 [profile.dev]
 codegen-units = 1

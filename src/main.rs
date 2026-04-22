@@ -339,7 +339,8 @@ mod app {
             let mut line: String<512> = String::new();
             let _ = write!(
                 &mut line,
-                ">speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, P:{:.4}, I:{:.4}, D:{:.4}, power:{}\r\n",
+                ">time_us:{}, speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, P:{:.4}, I:{:.4}, D:{:.4}, power:{}\r\n",
+                now_us,
                 speed,
                 setpoint,
                 error,

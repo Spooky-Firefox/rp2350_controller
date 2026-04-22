@@ -1,7 +1,7 @@
 use defmt::warn;
 
 pub trait Controller {
-    fn update(&mut self, speed_mps: f32, dt_s: f32) -> [u16; 2];
+    fn update(&mut self, distance_increment_m: f32, dt_s: f32) -> [u16; 2];
     fn set_speed_setpoint(&mut self, setpoint_mps: f32);
 }
 
@@ -24,15 +24,13 @@ pub struct StraightLineSpeedController {
 }
 
 impl Controller for StraightLineSpeedController {
-    fn update(&mut self, speed_mps: f32, dt_s: f32) -> [u16; 2] {
-        if dt_s > 0.0 {
-            self.measured_distance_m += speed_mps.abs() * dt_s;
-        }
+    fn update(&mut self, distance_increment_m: f32, dt_s: f32) -> [u16; 2] {
+        self.measured_distance_m += distance_increment_m;
 
         let error = self.distance_setpoint_m - self.measured_distance_m;
         warn!(
-            "Speed: {} m/s, Distance: {} m, Setpoint: {} m, Error: {} m",
-            speed_mps,
+            "Distance inc: {} m, Distance: {} m, Setpoint: {} m, Error: {} m",
+            distance_increment_m,
             self.measured_distance_m,
             self.distance_setpoint_m,
             error

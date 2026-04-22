@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Cortex Debug (OpenOCD)",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/target/thumbv8m.main-none-eabihf/debug/rp2350_controller",
+      "request": "launch",
+      "type": "cortex-debug",
+      "runToEntryPoint": "main",
+      "servertype": "openocd",
+      "openocdConfig": "${workspaceFolder}/.vscode/openocd.cfg",
+      "armToolchainPath": "/usr/bin",
+      "showDevDebugOutput": true,
+      "preLaunchTask": "build",
+      "postDebugTask": "stop openocd"
+    },
+    {
+      "name": "Debug (GDB)",
+      "type": "gdb",
+      "request": "launch",
+      "target": "${workspaceFolder}/target/thumbv8m.main-none-eabihf/debug/rp2350_controller",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build",
+      "stopAtEntry": true
+    },
+    {
+      "name": "Attach (OpenOCD)",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/target/thumbv8m.main-none-eabihf/debug/rp2350_controller",
+      "request": "attach",
+      "type": "cortex-debug",
+      "servertype": "openocd",
+      "openocdConfig": "${workspaceFolder}/.vscode/openocd.cfg",
+      "armToolchainPath": "/usr/bin",
+      "showDevDebugOutput": true
+    }
+  ]
+}

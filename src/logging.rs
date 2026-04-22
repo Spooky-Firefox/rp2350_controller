@@ -24,22 +24,45 @@ pub fn write_log_data(
     mut usb_dev: impl Mutex<T = UsbDevice<'static, MyUsbBus>>,
     mut serial: impl Mutex<T = SerialPort<'static, MyUsbBus>>,
 ) {
-    // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
     let mut line: String<256> = String::new();
-    let _ = write!(
-        &mut line,
-        ">time_us:{}, steer_ms:{}, throttle_ms:{}, speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, kalman0:{:.4}, kalman1:{:.4}, kalman2:{:.4}, kalman3:{:.4}\r\n",
-        data.timestamp,
-        data.steer_value_ms,
-        data.throttle_value_ms,
-        data.speed_value,
-        data.setpoint_value,
-        data.error_value,
-        data.kalman_values[0],
-        data.kalman_values[1],
-        data.kalman_values[2],
-        data.kalman_values[3],
-    );
+    
+    #[cfg(not(feature = "simple_csv"))]
+    {
+        // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
+        let _ = write!(
+            &mut line,
+            ">time_us:{}, steer_ms:{}, throttle_ms:{}, speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, kalman0:{:.4}, kalman1:{:.4}, kalman2:{:.4}, kalman3:{:.4}\r\n",
+            data.timestamp,
+            data.steer_value_ms,
+            data.throttle_value_ms,
+            data.speed_value,
+            data.setpoint_value,
+            data.error_value,
+            data.kalman_values[0],
+            data.kalman_values[1],
+            data.kalman_values[2],
+            data.kalman_values[3],
+        );
+    }
+    
+    #[cfg(feature = "simple_csv")]
+    {
+        // Simple CSV format: value,value,value\r\n
+        let _ = write!(
+            &mut line,
+            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\r\n",
+            data.timestamp,
+            data.steer_value_ms,
+            data.throttle_value_ms,
+            data.speed_value,
+            data.setpoint_value,
+            data.error_value,
+            data.kalman_values[0],
+            data.kalman_values[1],
+            data.kalman_values[2],
+            data.kalman_values[3],
+        );
+    }
 
     (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
         // Only emit plot data when the device is configured and host has opened the port.

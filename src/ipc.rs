@@ -1,5 +1,5 @@
 //! Inter-core communication types and SIO FIFO primitives.
-#![deny(unsafe_code)]
+#![allow(unsafe_code)] // FifoTx/FifoRx use direct PAC register access; see safety comments.
 //!
 //! # SensorEvent (Core 0 → Core 1): 6 × 32-bit FIFO words
 //!
@@ -23,6 +23,7 @@
 //! | 0    | `[steer_pwm_us: u16 | power_pwm_us: u16]` |
 
 use rp235x_hal::sio::SioFifo;
+use rp235x_pac;
 
 /// Sensor event packed as 6 × u32 words for SIO FIFO transfer.
 #[derive(Clone, Copy, Debug)]
@@ -139,41 +140,48 @@ impl ControlEvent {
     }
 
     pub fn from_fifo_chanel_blocking(channel: &mut FifoChannel) -> Self {
-        match channel.fifo.read_blocking() {
+        Self::read_words(|| channel.fifo.read_blocking())
+    }
+
+    /// Receive a [`ControlEvent`] from Core 1 using the split [`FifoRx`] half.
+    /// Used by `sio_interrupt` on Core 0.
+    pub fn from_fifo_rx_blocking(rx: &mut FifoRx) -> Self {
+        Self::read_words(|| rx.read_word_blocking())
+    }
+
+    fn read_words(mut read: impl FnMut() -> u32) -> Self {
+        match read() {
             1 => {
-                let w = channel.fifo.read_blocking();
-                let steer_pwm_us = ((w >> 16) & 0xFF) as u16;
+                let w = read();
+                let steer_pwm_us = ((w >> 16) & 0xFFFF) as u16;
                 let power_pwm_us = (w & 0xFFFF) as u16;
-                return ControlEvent::Control {
+                ControlEvent::Control {
                     steer_pwm_us,
                     power_pwm_us,
-                };
+                }
             }
             2 => {
-                let error = f32::from_bits(channel.fifo.read_blocking());
-                let proportional = f32::from_bits(channel.fifo.read_blocking());
-                let integral = f32::from_bits(channel.fifo.read_blocking());
-                let derivative = f32::from_bits(channel.fifo.read_blocking());
-                return ControlEvent::Pid {
+                let error = f32::from_bits(read());
+                let proportional = f32::from_bits(read());
+                let integral = f32::from_bits(read());
+                let derivative = f32::from_bits(read());
+                ControlEvent::Pid {
                     error,
                     proportional,
                     integral,
                     derivative,
-                };
+                }
             }
             3 => {
-                let x0 = f32::from_bits(channel.fifo.read_blocking());
-                let x1 = f32::from_bits(channel.fifo.read_blocking());
-                let x2 = f32::from_bits(channel.fifo.read_blocking());
-                let x3 = f32::from_bits(channel.fifo.read_blocking());
-                return ControlEvent::KalmanDebug {
+                let x0 = f32::from_bits(read());
+                let x1 = f32::from_bits(read());
+                let x2 = f32::from_bits(read());
+                let x3 = f32::from_bits(read());
+                ControlEvent::KalmanDebug {
                     x: [x0, x1, x2, x3],
-                };
+                }
             }
-            _ => {
-                // Handle unknown event type or error as needed.
-                panic!("Unknown control event type or FIFO read error");
-            }
+            _ => panic!("Unknown control event type received from Core 1"),
         }
     }
 }
@@ -216,6 +224,108 @@ impl TimeExtender {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Core 0 split FIFO halves
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Core 0 write-only FIFO half: Core 0 → Core 1.
+///
+/// Shared only with tasks that send sensor events (max priority 3), so its
+/// RTIC priority ceiling is 3. That means `sio_interrupt` (priority 4) can
+/// always preempt a task holding this lock — keeping Core 1's reply path
+/// unblocked and preventing the inter-core FIFO deadlock.
+pub struct FifoTx;
+
+impl FifoTx {
+    fn is_write_ready() -> bool {
+        // SAFETY: read-only status register, no aliasing concerns.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        sio.fifo_st().read().rdy().bit_is_set()
+    }
+
+    fn write_word(value: u32) {
+        // SAFETY: Only Core 0 writes to fifo_wr; no concurrent writers exist.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        sio.fifo_wr().write(|w| unsafe { w.bits(value) });
+        cortex_m::asm::sev();
+    }
+
+    fn write_word_blocking(value: u32) {
+        while !Self::is_write_ready() {
+            cortex_m::asm::nop();
+        }
+        Self::write_word(value);
+    }
+
+    /// Send a [`SensorEvent`] (6 blocking writes) to Core 1.
+    ///
+    /// It is safe to block here because `sio_interrupt` (priority 4) can
+    /// preempt any task holding `FifoTx` (ceiling 3) to drain the
+    /// Core1 → Core0 FIFO, keeping Core 1 unblocked.
+    pub fn send_sensor_event(&mut self, event: &SensorEvent) {
+        for &w in &event.to_words() {
+            Self::write_word_blocking(w);
+        }
+    }
+}
+
+/// Core 0 read-only FIFO half: Core 1 → Core 0.
+///
+/// Used exclusively by `sio_interrupt` (priority 4). Its RTIC priority
+/// ceiling is therefore 4, which is what allows `sio_interrupt` to preempt
+/// any task holding `FifoTx` (ceiling 3).
+pub struct FifoRx {
+    rx_count: usize,
+}
+
+impl FifoRx {
+    fn new() -> Self {
+        Self {
+            rx_count: 0,
+        }
+    }
+
+    pub fn have_data(&mut self) -> bool {
+        // SAFETY: read-only status register.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        sio.fifo_st().read().vld().bit_is_set()
+    }
+
+    pub fn read_word_blocking(&mut self) -> u32 {
+        loop {
+            // SAFETY: Only Core 0 reads from fifo_rd; no concurrent readers.
+            let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+            if sio.fifo_st().read().vld().bit_is_set() {
+                return sio.fifo_rd().read().bits();
+            }
+            cortex_m::asm::nop();
+        }
+    }
+
+    pub fn drain(&mut self) {
+        loop {
+            // SAFETY: Only Core 0 reads from fifo_rd.
+            let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+            if sio.fifo_st().read().vld().bit_is_set() {
+                let _ = sio.fifo_rd().read().bits();
+            } else {
+                break;
+            }
+        }
+        self.rx_count = 0;
+    }
+}
+
+/// Consume the Core 0 [`SioFifo`] and produce separate [`FifoTx`] / [`FifoRx`]
+/// halves that live in independent RTIC shared resources, giving them distinct
+/// priority ceilings and breaking the potential inter-core FIFO deadlock.
+pub fn split_fifo(fifo: SioFifo) -> (FifoTx, FifoRx) {
+    // The HAL SioFifo is consumed and dropped; FifoTx/FifoRx access the same
+    // hardware via direct PAC register reads/writes.
+    drop(fifo);
+    (FifoTx, FifoRx::new())
+}
+
 impl Default for TimeExtender {
     fn default() -> Self {
         Self::new()
@@ -253,12 +363,7 @@ impl FifoChannel {
         self.fifo.drain();
     }
 
-    /// Send a complete [`SensorEvent`] (6 blocking writes).
-    pub fn send_sensor_event(&mut self, event: &SensorEvent) {
-        for &w in &event.to_words() {
-            self.fifo.write_blocking(w);
-        }
-    }
+
 
     /// Send a complete [`ControlEvent`] (1 blocking write).
     pub fn send_control_event_blocking(&mut self, event: &ControlEvent) {

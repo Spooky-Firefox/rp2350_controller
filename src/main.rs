@@ -6,23 +6,17 @@ use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
 use fugit::{ExtU64, MicrosDurationU32, TimerDurationU32};
 use hal::gpio;
-use heapless::String;
+use hal::multicore::Stack;
 use panic_probe as _;
 use rp235x_hal as hal;
 use rp235x_pac as pac;
+use rp2350_controller::constants::*;
 use rp2350_controller::entry::entry;
 use rp2350_controller::ipc;
+use rp2350_controller::logging::LogData;
 use rp2350_controller::usb_serial::{MyUsbBus, init_usb_serial};
-use usb_device::{
-    class_prelude::UsbBusAllocator,
-    device::{UsbDevice, UsbDeviceState},
-};
+use usb_device::{class_prelude::UsbBusAllocator, device::UsbDevice};
 use usbd_serial::SerialPort;
-
-use core::f32::consts::PI;
-use core::fmt::Write as _;
-
-use hal::multicore::Stack;
 // 2^16 = 65536 bytes = 64 KB stack size for core 1 (adjust as needed).
 static mut CORE1_STACK: Stack<65536> = Stack::new();
 
@@ -31,20 +25,6 @@ static mut CORE1_STACK: Stack<65536> = Stack::new();
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
-
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-// CPU clock speed (150 MHz). All timers and PWM are derived from this.
-const SYS_CLOCK_HZ: u32 = 150_000_000;
-const PWM_DIV_INT: u8 = 64;
-const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / PWM_DIV_INT as u32;
-
-/// Arc length per encoder pulse [m].
-const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 13.0 * PI / 300.0;
-
-// Standard RC-servo frame period (50 Hz).
-const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);
-const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_500);
 
 // Shorthand for GPIO25 configured as a digital output (LED pin).
 type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
@@ -60,23 +40,13 @@ type MotorPwmPinB = gpio::Pin<gpio::bank0::Gpio17, gpio::FunctionPwm, gpio::Pull
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [DMA_IRQ_0, DMA_IRQ_1])]
 mod app {
 
-    use core::task;
-
-    use defmt::{debug, info, trace, warn};
+    use defmt::trace;
     use embedded_hal::pwm::SetDutyCycle;
     use fugit::{MicrosDurationU32, TimerInstantU64};
-    use rp2350_controller::controller_processor;
+    use rp2350_controller::usb_serial::process_usb_command;
     use rtic_monotonics::Monotonic;
 
     use super::*;
-
-    pub struct PidDbg {
-        pub error: f32,
-        pub proportional: f32,
-        pub integral: f32,
-        pub derivative: f32,
-    }
-
     #[shared]
     struct Shared {
         usb_dev: UsbDevice<'static, MyUsbBus>,
@@ -85,8 +55,8 @@ mod app {
         speed_setpoint_mps: f32,
         measured_speed_mps: f32,
         last_sensor_irq_us: u64,
-        fifo: ipc::FifoChannel,
-        pid_dbg: PidDbg,
+        fifo_tx: ipc::FifoTx,
+        fifo_rx: ipc::FifoRx,
         power: u16,
     }
 
@@ -97,11 +67,13 @@ mod app {
         led: LedPin,
         _pwm_a_pin: MotorPwmPinA,
         _pwm_b_pin: MotorPwmPinB,
+        log_data_producer: heapless::spsc::Producer<'static, LogData, 128>,
+        log_data_consumer: heapless::spsc::Consumer<'static, LogData, 128>,
     }
 
     rtic_monotonics::rp235x_timer_monotonic!(MainMono);
 
-    #[init(local = [usb_bus: Option<UsbBusAllocator<MyUsbBus>> = None])]
+    #[init(local = [usb_bus: Option<UsbBusAllocator<MyUsbBus>> = None, dataQueue: heapless::spsc::Queue<LogData, 128> = heapless::spsc::Queue::new()])]
     fn init(ctx: init::Context) -> (Shared, Local) {
         // Perform early hardware setup (spinlocks, co-processor enable).
         // This calls entry::entry() which is a copy of hal::entry().
@@ -185,13 +157,14 @@ mod app {
             });
         }
 
-        let fifo = ipc::FifoChannel::new(sio.fifo);
+        let (fifo_tx, fifo_rx) = ipc::split_fifo(sio.fifo);
         delay_update_setpoint::spawn().unwrap();
 
         MainMono::start(pac.TIMER0, &pac.RESETS);
         toggle_led::spawn().unwrap();
         sensor_timeout::spawn().unwrap();
-        log_data::spawn().unwrap();
+        periodic_drain_log_data::spawn().unwrap();
+        let (log_data_producer, log_data_consumer) = ctx.local.dataQueue.split();
         (
             Shared {
                 usb_dev,
@@ -200,13 +173,8 @@ mod app {
                 speed_setpoint_mps: 0.0,
                 measured_speed_mps: 0.0,
                 last_sensor_irq_us: 0,
-                fifo,
-                pid_dbg: PidDbg {
-                    error: 0.0,
-                    proportional: 0.0,
-                    integral: 0.0,
-                    derivative: 0.0,
-                },
+                fifo_tx,
+                fifo_rx,
                 power: 0,
             },
             Local {
@@ -215,6 +183,8 @@ mod app {
                 encoder_last_time: TimerInstantU64::<1_000_000>::from_ticks(0),
                 _pwm_a_pin: pwm_a_pin,
                 _pwm_b_pin: pwm_b_pin,
+                log_data_producer,
+                log_data_consumer,
             },
         )
     }
@@ -244,7 +214,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0,encoder, encoder_last_time], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -278,7 +248,7 @@ mod app {
                     0.0,
                     time_diff.ticks() as f32,
                 );
-                ctx.shared.fifo.lock(|fifo| fifo.send_sensor_event(&event));
+                ctx.shared.fifo_tx.lock(|tx| tx.send_sensor_event(&event));
             }
 
             ctx.local
@@ -287,7 +257,7 @@ mod app {
         }
     }
 
-    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo], priority = 2)]
+    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx], priority = 2)]
     async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
         loop {
             MainMono::delay(100u64.millis()).await;
@@ -299,79 +269,60 @@ mod app {
                 let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
                 ctx.shared.measured_speed_mps.lock(|speed| *speed = 0.0);
                 let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
-                ctx.shared.fifo.lock(|fifo| fifo.send_sensor_event(&event));
+                ctx.shared.fifo_tx.lock(|tx| tx.send_sensor_event(&event));
             }
         }
     }
 
-    /// Periodic telemetry logging hook. Easy place to later mirror data to USB serial.
-    #[task(shared = [usb_dev, serial, speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, pid_dbg, power], priority = 1)]
-    async fn log_data(mut ctx: log_data::Context) -> ! {
+    /// Periodic logging hook that processes queued log data and sends to USB serial.
+    #[task(local = [log_data_consumer, drain_count: u32 = 0], shared = [usb_dev, serial], priority = 1)]
+    async fn log_data(mut ctx: log_data::Context) {
+        let mut data_count = 0;
+        while let Some(data) = ctx.local.log_data_consumer.dequeue() {
+            data_count += 1;
+            trace!("Dequeued log data #{}", data_count);
+            rp2350_controller::logging::write_log_data(
+                data,
+                &mut ctx.shared.usb_dev,
+                &mut ctx.shared.serial,
+            );
+        }
+        if data_count > 0 {
+            trace!("Logged {} data points", data_count);
+        }
+    }
+
+    #[task(priority = 1)]
+    async fn periodic_drain_log_data(_ctx: periodic_drain_log_data::Context) -> ! {
+        let mut cycle_count = 0u32;
         loop {
-            MainMono::delay(250u64.millis()).await;
-
-            let now_us = MainMono::now().ticks();
-            let setpoint = ctx.shared.speed_setpoint_mps.lock(|v| *v);
-            let speed = ctx.shared.measured_speed_mps.lock(|v| *v);
-            let age_us = ctx
-                .shared
-                .last_sensor_irq_us
-                .lock(|last| now_us.saturating_sub(*last));
-
-            info!(
-                "speed: measured={} m/s setpoint={} m/s age={} us",
-                speed, setpoint, age_us
-            );
-
-            let PidDbg {
-                error,
-                proportional,
-                integral,
-                derivative,
-            } = ctx.shared.pid_dbg.lock(|dbg| PidDbg {
-                error: dbg.error,
-                proportional: dbg.proportional,
-                integral: dbg.integral,
-                derivative: dbg.derivative,
-            });
-
-            // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
-            let mut line: String<512> = String::new();
-            let _ = write!(
-                &mut line,
-                ">time_us:{}, speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, P:{:.4}, I:{:.4}, D:{:.4}, power:{}\r\n",
-                now_us,
-                speed,
-                setpoint,
-                error,
-                proportional,
-                integral,
-                derivative,
-                ctx.shared.power.lock(|p| *p)
-            );
-
-            (&mut ctx.shared.usb_dev, &mut ctx.shared.serial).lock(|usb_dev, serial| {
-                // Only emit plot data when the device is configured and host has opened the port.
-                if usb_dev.state() == UsbDeviceState::Configured && serial.dtr() {
-                    let _ = usb_dev.poll(&mut [serial]);
-                    let r = serial.write(line.as_bytes());
-                    if let Err(e) = r {
-                        warn!("USB serial write error: {:?}", defmt::Debug2Format(&e));
-                    }
-                }
-            });
+            cycle_count = cycle_count.wrapping_add(1);
+            trace!("periodic_drain_log_data cycle {}", cycle_count);
+            log_data::spawn().ok(); // Trigger log processing task.
+            MainMono::delay(100u64.millis()).await;
         }
     }
 
     /// Receives control events from Core 1 and applies PWM outputs.
-    #[task(binds = SIO_IRQ_FIFO, shared = [pwm, fifo, pid_dbg, power], priority = 2)]
+    #[task(binds = SIO_IRQ_FIFO, local = [log_data_producer],shared = [pwm, fifo_rx, power,measured_speed_mps,speed_setpoint_mps], priority = 4)]
     fn sio_interrupt(ctx: sio_interrupt::Context) {
         let mut pwm = ctx.shared.pwm;
-        let mut fifo = ctx.shared.fifo;
-        let mut pid_dbg = ctx.shared.pid_dbg;
+        let mut fifo_rx = ctx.shared.fifo_rx;
         let mut power = ctx.shared.power;
-        while fifo.lock(|f| f.have_data()) {
-            match fifo.lock(ipc::ControlEvent::from_fifo_chanel_blocking) {
+        let mut measured_speed_mps = ctx.shared.measured_speed_mps;
+        let mut speed_setpoint_mps = ctx.shared.speed_setpoint_mps;
+
+        let mut log_data = LogData {
+            timestamp: MainMono::now(),
+            steer_value_ms: 0,
+            throttle_value_ms: 0,
+            setpoint_value: speed_setpoint_mps.lock(|s| *s),
+            error_value: 0.0,
+            speed_value: measured_speed_mps.lock(|s| *s),
+            kalman_values: [0.0; 4],
+        };
+        while fifo_rx.lock(|rx| rx.have_data()) {
+            match fifo_rx.lock(ipc::ControlEvent::from_fifo_rx_blocking) {
                 ipc::ControlEvent::Control {
                     steer_pwm_us,
                     power_pwm_us,
@@ -380,7 +331,8 @@ mod app {
                         MicrosDurationU32::from_ticks(steer_pwm_us as u32).min(PWM_PERIOD);
                     let power_on =
                         MicrosDurationU32::from_ticks(power_pwm_us as u32).min(PWM_PERIOD);
-
+                    log_data.steer_value_ms = steer_on.ticks() as u16;
+                    log_data.throttle_value_ms = power_on.ticks() as u16;
                     pwm.lock(|pwm| {
                         let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
                         let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
@@ -390,158 +342,36 @@ mod app {
                 }
                 ipc::ControlEvent::Pid {
                     error,
-                    proportional,
-                    integral,
-                    derivative,
+                    proportional: _,
+                    integral: _,
+                    derivative: _,
                 } => {
-                    pid_dbg.lock(|dbg| {
-                        dbg.error = error;
-                        dbg.proportional = proportional;
-                        dbg.integral = integral;
-                        dbg.derivative = derivative;
-                    });
-                    trace!(
-                        "pid: error={} P={} I={} D={}",
-                        error, proportional, integral, derivative
-                    );
+                    log_data.error_value = error;
                 }
-                _ => {
-                    // Ignore other event types for now.
+                ipc::ControlEvent::KalmanDebug { x } => {
+                    log_data.kalman_values = x;
                 }
             }
         }
+        ctx.local.log_data_producer.enqueue(log_data).ok(); // Ignore enqueue failures if the log queue is full.
+        if ctx.local.log_data_producer.capacity() == 0 {
+            log_data::spawn(); // Trigger log processing if we have data to send but the consumer might be idle.
+        }
     }
 
-    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial, pwm, speed_setpoint_mps], priority = 2)]
-    fn usb_interrupt(mut ctx: usb_interrupt::Context) {
-        info!("usb interrupt");
-        let mut usb_dev = ctx.shared.usb_dev;
-        let mut serial = ctx.shared.serial;
-        let mut pwm = ctx.shared.pwm;
+    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial, pwm, speed_setpoint_mps], priority = 5)]
+    fn usb_interrupt(ctx: usb_interrupt::Context) {
+        trace!("USBCTRL_IRQ fired");
+        let usb_dev = ctx.shared.usb_dev;
+        let serial = ctx.shared.serial;
+        let pwm = ctx.shared.pwm;
+        let speed_setpoint = ctx.shared.speed_setpoint_mps;
 
         let buff = ctx.local.buff;
         let buff_len = ctx.local.buff_len;
 
-        // read data from usb serial and store it in the local buffer. The buffer length is stored in a local variable as well.
-        let mut bytes_read = 0;
-        (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-            if !usb_dev.poll(&mut [serial]) {
-                return;
-            }
-
-            while *buff_len < buff.len() {
-                let Ok(count) = serial.read(&mut buff[*buff_len..]) else {
-                    break;
-                };
-                if count == 0 {
-                    break;
-                }
-                bytes_read += count;
-                *buff_len += count;
-            }
-
-            // Echo received data back to USB if feature is enabled (skip CR/LF to avoid cursor jumping)
-            #[cfg(feature = "echo_usb")]
-            if bytes_read > 0 {
-                for &byte in &buff[*buff_len - bytes_read..*buff_len] {
-                    if byte != b'\r' && byte != b'\n' {
-                        let _ = serial.write(&[byte]);
-                    }
-                }
-                usb_dev.poll(&mut [serial]);
-            }
-        });
-
-        if *buff_len == buff.len() {
-            info!("USB command too long, dropping buffer");
-            *buff_len = 0;
-            return;
-        }
-        if *buff_len > 0 && (buff[*buff_len - 1] == b'\n' || buff[*buff_len - 1] == b'\r') {
-            // Newline-terminated command framing.
-            let command = core::str::from_utf8(&buff[..*buff_len]).unwrap_or("<invalid utf-8>");
-            let command = command.trim();
-            info!("Received command: {}", command);
-            *buff_len = 0;
-
-            if let Some(rest) = command.strip_prefix("pwm-a ") {
-                if let Some(on_time_us) = parse_on_time_us(rest) {
-                    let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
-                    let ticks = micros_to_pwm_ticks(on_time);
-                    pwm.lock(|pwm| {
-                        let _ = pwm.channel_a.set_duty_cycle(ticks);
-                    });
-                    info!(
-                        "Set PWM A on-time to {} us ({} ticks)",
-                        on_time.ticks(),
-                        ticks
-                    );
-
-                    // Echo success if feature is enabled
-                    #[cfg(feature = "echo_usb")]
-                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                        let _ = serial.write(b"\r\nOK\r\n");
-                        usb_dev.poll(&mut [serial]);
-                    });
-                } else {
-                    info!("Invalid pwm-a value: {}", rest);
-                }
-            } else if let Some(rest) = command.strip_prefix("speed ") {
-                if let Some(setpoint_mps) = parse_speed_setpoint(rest) {
-                    ctx.shared
-                        .speed_setpoint_mps
-                        .lock(|setpoint| *setpoint = setpoint_mps);
-                    info!("Set speed setpoint to {} m/s", setpoint_mps);
-
-                    #[cfg(feature = "echo_usb")]
-                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                        let _ = serial.write(b"\r\nOK\r\n");
-                        usb_dev.poll(&mut [serial]);
-                    });
-                } else {
-                    info!("Invalid speed value: {}", rest);
-                }
-            } else if let Some(rest) = command.strip_prefix("pwm-b ") {
-                if let Some(on_time_us) = parse_on_time_us(rest) {
-                    let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
-                    let ticks = micros_to_pwm_ticks(on_time);
-                    pwm.lock(|pwm| {
-                        let _ = pwm.channel_b.set_duty_cycle(ticks);
-                    });
-                    info!(
-                        "Set PWM B on-time to {} us ({} ticks)",
-                        on_time.ticks(),
-                        ticks
-                    );
-
-                    // Echo success if feature is enabled
-                    #[cfg(feature = "echo_usb")]
-                    (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                        let _ = serial.write(b"\r\nOK\r\n");
-                        usb_dev.poll(&mut [serial]);
-                    });
-                } else {
-                    info!("Invalid pwm-b value: {}", rest);
-                }
-            } else {
-                info!("Unknown command: {}", command);
-                #[cfg(feature = "echo_usb")]
-                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                    let _ = serial.write(b"\r\nERR: unknown/malformed command\r\n");
-                    usb_dev.poll(&mut [serial]);
-                });
-            }
-        }
+        process_usb_command(usb_dev, serial, pwm, buff, buff_len, speed_setpoint);
     }
-}
-
-// Parse USB command argument as microseconds. Returns None if not a valid number.
-fn parse_on_time_us(arg: &str) -> Option<u32> {
-    arg.trim().parse::<u32>().ok()
-}
-
-fn parse_speed_setpoint(arg: &str) -> Option<f32> {
-    arg.trim().parse::<f32>().ok()
 }
 
 // Convert microseconds to PWM counter ticks at the PWM timer frequency.

@@ -20,11 +20,14 @@ The program uses a framework called **RTIC** (Real-Time Interrupt-driven Concurr
 Each task has a **priority level** — higher priority tasks can interrupt lower priority ones if they need to run urgently.
 
 ```text
-Priority 3 (highest) │  gpio_interrupt   — encoder edge detected
-Priority 2           │  sio_interrupt    — control output from Core 1
-                     │  sensor_timeout   — no encoder pulse for 100 ms
-                     │  usb_interrupt    — USB data arrived
+Priority 5 (highest) │  usb_interrupt    — USB data arrived
+Priority 4           │  sio_interrupt    — control output from Core 1
+Priority 3           │  gpio_interrupt   — encoder edge detected
+Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
+                     │  delay_update_setpoint — defer setpoint updates
+                     │  log_data         — send logging data to host
+                     │  periodic_drain_log_data — trigger log buffer drain
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -37,8 +40,11 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
 | `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, sends `SensorEvent` to Core 1 |
 | `sensor_timeout` | Every 100 ms (if no encoder pulse) | Sends a timeout event to Core 1 so the filter can coast |
+| `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
 | `sio_interrupt` | Core 1 writes to FIFO | Receives `ControlEvent` and applies PWM outputs |
 | `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
+| `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
+| `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
 
 ---
 
@@ -147,6 +153,69 @@ ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
 
 For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a raw register block. Core 0 locks it before sending or receiving FIFO messages; Core 1 owns its own `FifoChannel` instance in its blocking loop.
+
+---
+
+## Real-Time Logging — Serial Plotter Integration
+
+The program continuously collects telemetry data and streams it to the host PC in **VS Code Serial Plotter format**. This allows real-time visualization of system state without special software.
+
+### Logging Pipeline
+
+```text
+Core 1 (control loop)           Core 0 (I/O)
+    │                               │
+    └─→ [log_data_producer] ───────→ Channel
+                                    │
+                                ┌───┴───┐
+                                │       ├─→ [log_data_consumer ring buffer]
+                                │       │
+                                └───┬───┘
+                                    │
+                 [periodic_drain_log_data] (every 50 ms)
+                                    │
+                                [log_data task]
+                                    │
+                              [USB Serial]
+                                    │
+                              [PC / VS Code]
+```
+
+### Format
+
+Each log line is sent in **VS Code Serial Plotter format**, prefixed with `>` and containing comma-separated `name:value` pairs:
+
+```
+>time_us:12345678, steer_ms:1500, throttle_ms:1500, speed_mps:0.5234, setpoint_mps:0.5000, error:0.0234, kalman0:0.5200, kalman1:0.0012, kalman2:0.0001, kalman3:-0.0003
+```
+
+This data is automatically plotted by VS Code's Serial Plotter extension when it detects a running terminal on the serial port.
+
+### Key Implementation Details
+
+- **Core 1 produces data:** The control loop writes telemetry snapshots to a ring buffer via `log_data_producer`
+- **Core 0 consumes data:** The `log_data` task drains the buffer and formats it for USB transmission
+- **Throttled transmission:** Data is sent every 50 ms (20 Hz) by `periodic_drain_log_data`, preventing USB from being overwhelmed
+- **Async tasks:** Both `log_data` and `periodic_drain_log_data` are async tasks to avoid blocking higher-priority interrupts
+
+---
+
+## Code Organization
+
+The firmware is organized into several Rust modules:
+
+| Module | Purpose |
+| ------ | ------- |
+| `main.rs` | RTIC task definitions, hardware initialization, interrupt handlers |
+| `lib.rs` | Top-level definitions and module exports |
+| `constants.rs` | Global configuration constants (clock speeds, PWM settings, encoder calibration) |
+| `logging.rs` | Telemetry logging and VS Code Serial Plotter formatting |
+| `utils.rs` | Utility functions (PWM tick conversion, time conversions) |
+| `ipc.rs` | Inter-process communication structures (`SensorEvent`, `ControlEvent`, `FifoChannel`) |
+| `usb_serial.rs` | USB device initialization and serial port handling |
+| `controller_processor/` | Core 1 control loop (Kalman filter, PID controller) |
+| `controller_processor/kalman_filter.rs` | Extended Kalman Filter implementation |
+| `controller_processor/controller.rs` | PID speed controller logic |
 
 ---
 

@@ -35,5 +35,6 @@ void loop() {
 
   // Vänta 100ms mellan varje mätning (10 mätningar i sekunden)
   // Justera efter hur tät data du behöver
-  delay(10);
+  delay(1);
 }
+  

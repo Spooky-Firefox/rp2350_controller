@@ -27,7 +27,7 @@ tThr = (double(thrTbl.timestamp_us) - double(thrTbl.timestamp_us(1))) / 1e6;
 thr  = double(thrTbl.throttle_us);
 
 tCur = (double(curTbl.Timestamp_ms) - double(curTbl.Timestamp_ms(1))) / 1e3;
-cur  = double(curTbl.Current_mA * 7.6);  % mA * V => mW (power)
+cur  = double(curTbl.Current_mA * 8.0);  % mA * V => mW (power)
 
 % Remove NaNs
 validThr = isfinite(tThr) & isfinite(thr);

@@ -28,6 +28,7 @@ Priority 1           │  toggle_led       — periodic heartbeat
                      │  delay_update_setpoint — defer setpoint updates
                      │  log_data         — send logging data to host
                      │  periodic_drain_log_data — trigger log buffer drain
+                     │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -45,6 +46,7 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
 | `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
 | `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
+| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
 
 ---
 
@@ -112,6 +114,16 @@ The HC-SR04 measures distance using ultrasound.  It has two signal pins:
 
 Distance in centimetres ≈ echo pulse width in µs ÷ 58.
 
+### Wiring
+
+| Sensor | TRIG pin | ECHO pin | PWM slice | Notes |
+| ------ | -------- | -------- | --------- | ----- |
+| 0 | GPIO 14 | GPIO 15 | Pwm7 B | |
+| 1 | GPIO 12 | GPIO 13 | Pwm6 B | |
+| 2 | GPIO 10 | GPIO 11 | Pwm5 B | |
+
+The TRIG pins are plain digital outputs (SioOutput).  The ECHO pins are connected to the B channel of their respective PWM slices — the B channel is the hardware gate input in `InputHighRunning` mode.
+
 ### How the counter works
 
 Instead of using a software timer to measure the echo pulse width, the driver connects the ECHO pin to the **B channel** of a dedicated PWM slice configured in **`InputHighRunning`** mode.  In this mode the hardware counter increments on every system-clock edge **only while pin B is high**.  When the echo falls, the counter value equals the pulse width in clock cycles — no interrupt latency error, no polling.
@@ -128,6 +140,21 @@ PWM ctr:  0 0 0 0 0 0 0 1 2 3 4 5 … N N N N N N N N N N 0
                          ↑ counting              ↑ read & reset
 ```
 
+### `ultrasound_scan` task
+
+The `ultrasound_scan` async task (priority 1) polls all three sensors in a round-robin loop with 60 ms between each measurement start:
+
+```text
+t = 0 ms   measure sensor 0  →  delay_until t+60 ms
+t = 60 ms  measure sensor 1  →  delay_until t+120 ms
+t = 120 ms measure sensor 2  →  delay_until t+180 ms
+t = 180 ms measure sensor 0  (next cycle)
+```
+
+`delay_until` is used instead of `delay` so the spacing is referenced to an absolute clock — if a measurement takes varying time (e.g. an echo arrives late), the inter-sensor gap stays deterministic.
+
+Each measurement result is logged via RTT (`defmt::info!`) showing both the raw µs value and an approximate centimetre figure.  Timeout (> 50 ms, no echo) is logged as a warning.
+
 ### Ownership split
 
 The driver is split into two objects with the same lifetime so neither needs to be an RTIC shared resource (which would raise the priority ceiling):
@@ -142,11 +169,11 @@ The driver is split into two objects with the same lifetime so neither needs to 
   init locals
   ┌──────────────────────────────────┐
   │ HcSr04Shared { waker, done }     │
-  │   &'static ──────────────────┐  │
-  │   &'static ──────────┐       │  │
-  └──────────────────────│───────│──┘
+  │   &'static ──────────────────┐   │
+  │   &'static ──────────┐       │   │
+  └──────────────────────│───────│───┘
                          │       │
-               HcSr04OnInterrupt │    ← gpio_interrupt task
+               HcSr04OnInterrupt │     ← gpio_interrupt task
                   .on_interrupt()│
                     sets done    │
                     waker.wake() │

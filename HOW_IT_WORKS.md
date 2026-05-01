@@ -140,6 +140,30 @@ PWM ctr:  0 0 0 0 0 0 0 1 2 3 4 5 … N N N N N N N N N N 0
                          ↑ counting              ↑ read & reset
 ```
 
+### 🚀 A Word on Over-Engineering
+
+**This PWM approach is completely ridiculous.**
+
+Why? The HC-SR04's own hardware measurement error is ±3 mm — roughly **30 µs of echo pulse width variance** depending on temperature, humidity, and reflectivity of the object. Yet we've dedicated **three PWM slices** to measure with **1 µs resolution** and zero software jitter.
+
+A far simpler approach would be:
+```rust
+let t_start = MainMono::now();
+// (echo fires interrupt)
+let t_end = MainMono::now();
+let pulse_us = (t_end - t_start).to_micros();
+```
+
+This would measure the same thing with **~1 µs ISR-entry jitter** — totally invisible given the sensor's ±3 mm error budget. The "complex" version adds nothing but code complexity and burns hardware resources.
+
+**Why did we do it this way?** Mostly to demonstrate:
+
+- RTIC patterns (split ownership, atomic waker, priority ceiling management)
+- Advanced PWM features (`InputHighRunning` counting mode)  
+- How to avoid shared resource locks with lock-free atomics
+
+In a real product, you'd use the simple `MainMono` approach. Here, consider this a **pedagogical over-engineered masterpiece** — proof that just because you *can* measure something to ±1 µs doesn't mean you *should*.
+
 ### `ultrasound_scan` task
 
 The `ultrasound_scan` async task (priority 1) polls all three sensors in a round-robin loop with 60 ms between each measurement start:

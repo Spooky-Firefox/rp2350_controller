@@ -3,6 +3,7 @@
 pub mod constants;
 pub mod controller_processor;
 pub mod entry;
+pub mod hc_sr04;
 pub mod ipc;
 pub mod logging;
 pub mod usb_serial;

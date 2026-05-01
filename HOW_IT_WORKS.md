@@ -101,6 +101,77 @@ There are two independent channels: **PWM-A** (GPIO 16) and **PWM-B** (GPIO 17).
 
 ---
 
+## HC-SR04 — Ultrasonic Distance Sensor
+
+The HC-SR04 measures distance using ultrasound.  It has two signal pins:
+
+| Pin | Direction | Description |
+| --- | --------- | ----------- |
+| TRIG | MCU → sensor | Hold high for ≥ 10 µs to fire one measurement |
+| ECHO | sensor → MCU | Goes high when the burst is sent; falls when the reflection arrives |
+
+Distance in centimetres ≈ echo pulse width in µs ÷ 58.
+
+### How the counter works
+
+Instead of using a software timer to measure the echo pulse width, the driver connects the ECHO pin to the **B channel** of a dedicated PWM slice configured in **`InputHighRunning`** mode.  In this mode the hardware counter increments on every system-clock edge **only while pin B is high**.  When the echo falls, the counter value equals the pulse width in clock cycles — no interrupt latency error, no polling.
+
+```text
+             trigger
+MCU TRIG: ──┐     ┌────────────────── (next measurement)
+            └─────┘  ← 20 µs busy-wait
+
+ECHO pin: ─────────────┐              ┌────────────────────
+                       └──────────────┘  ← echo pulse
+
+PWM ctr:  0 0 0 0 0 0 0 1 2 3 4 5 … N N N N N N N N N N 0
+                         ↑ counting              ↑ read & reset
+```
+
+### Ownership split
+
+The driver is split into two objects with the same lifetime so neither needs to be an RTIC shared resource (which would raise the priority ceiling):
+
+| Type | Stored in | Role |
+| ---- | --------- | ---- |
+| `HcSr04Shared` | `init` local (static) | Holds the `AtomicWaker` and done flag |
+| `HcSr04Measure` | Measuring async task local | Drives trigger, resets counter, awaits result |
+| `HcSr04OnInterrupt` | `gpio_interrupt` task local | Called from ISR; clears interrupt and wakes the future |
+
+```text
+  init locals
+  ┌──────────────────────────────────┐
+  │ HcSr04Shared { waker, done }     │
+  │   &'static ──────────────────┐  │
+  │   &'static ──────────┐       │  │
+  └──────────────────────│───────│──┘
+                         │       │
+               HcSr04OnInterrupt │    ← gpio_interrupt task
+                  .on_interrupt()│
+                    sets done    │
+                    waker.wake() │
+                                 │
+                        HcSr04Measure  ← async measuring task
+                           .measure().await
+                             poll_fn registers waker
+                             reads counter on wake
+```
+
+### Interrupt flow
+
+1. `HcSr04Measure::measure()` resets `done = false`, sends trigger pulse, resets counter.
+2. The future returned by `measure()` registers the task's `Waker` via `AtomicWaker::register()`.
+3. When the echo falls, `IO_IRQ_BANK0` fires → `gpio_interrupt` task → `on_interrupt()` is called.
+4. `on_interrupt()` checks `echo_pin.interrupt_status(EdgeLow)`, clears it, sets `done = true`, calls `AtomicWaker::wake_by_ref()`.
+5. The RTIC executor re-polls `measure()`.  `done` is now `true` → `Poll::Ready` → counter value is returned.
+6. If no echo arrives within the caller-supplied timeout, `rtic_time::Monotonic::timeout_after` returns `HcSr04Error::Timeout`.
+
+### Why no RTIC shared resource?
+
+The waker handoff uses an [`atomic_waker::AtomicWaker`](https://docs.rs/atomic-waker) and an `AtomicBool`, both of which are lock-free.  The interrupt handler (`gpio_interrupt`, priority 3) writes to these atomics with `Release` ordering; the async task reads with `Acquire` ordering.  This is sufficient for correct synchronisation on Cortex-M33 without raising any RTIC priority ceiling.
+
+---
+
 ## Encoder — Measuring Speed
 
 A Hall-effect encoder detects magnets on a rotating shaft. Each time a magnet passes the sensor, the pin on GPIO 13 goes from low to high (a **rising edge**), triggering `gpio_interrupt`.
@@ -209,6 +280,7 @@ The firmware is organized into several Rust modules:
 | `main.rs` | RTIC task definitions, hardware initialization, interrupt handlers |
 | `lib.rs` | Top-level definitions and module exports |
 | `constants.rs` | Global configuration constants (clock speeds, PWM settings, encoder calibration) |
+| `hc_sr04.rs` | HC-SR04 ultrasonic distance sensor driver (split ownership, async measurement) |
 | `logging.rs` | Telemetry logging and VS Code Serial Plotter formatting |
 | `utils.rs` | Utility functions (PWM tick conversion, time conversions) |
 | `ipc.rs` | Inter-process communication structures (`SensorEvent`, `ControlEvent`, `FifoChannel`) |

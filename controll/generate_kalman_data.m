@@ -18,64 +18,111 @@ function sim_data = generate_kalman_data(output_file)
     PLANT.L   = 0.265;    % wheelbase [m]
     PLANT.r_w = 0.0325;   % wheel radius [m]
     PLANT.W   = 0.200;    % track width [m]
+    PLANT.wheel_circumference = 2 * pi * PLANT.r_w;  % full wheel circumference [m]
+    PLANT.pulses_per_rotation = 3;                    % encoder pulses per full rotation
+    PLANT.pulse_distance = PLANT.wheel_circumference / PLANT.pulses_per_rotation; % [m/pulse]
 
-    % Sensor shaft spins 3x faster than the wheel.
-    PLANT.gear_ratio = 3.0;                      % sensor speed / wheel speed [-]
-    PLANT.speed_ratio = PLANT.r_w / PLANT.gear_ratio;   % [m/rad]
+    % Steering actuator (2nd-order) and PWM mapping configuration.
+    PLANT.steer.max_angle_deg = 28;          % +/- max steering angle [deg]
+    PLANT.steer.max_rate_deg_s = 360;        % physical steering rate clamp [deg/s]
+    PLANT.steer.wn = 18.0;                   % actuator natural frequency [rad/s]
+    PLANT.steer.zeta = 0.9;                  % actuator damping ratio [-]
 
-    % Measurement noise used to synthesize sensor data.
-    SENSOR.r_cam_xy    = 0.02;   % [m]
-    SENSOR.r_cam_theta = 0.05;   % [rad]
-    SENSOR.r_omega     = 0.5;    % [rad/s]
+    PLANT.throttle.deadband_us = 25;         % +/- deadband around 1500 us
+    PLANT.throttle.max_accel_fwd = 2.2;      % [m/s^2]
+    PLANT.throttle.max_accel_rev = 1.8;      % [m/s^2]
+    PLANT.throttle.drag_coeff = 0.35;        % simple linear drag [1/s]
+
+    % Timing uncertainty per wheel pulse.
+    % On real hardware this is your timer resolution + interrupt latency.
+    SENSOR.r_wheel_dt = 0.001;   % timing noise std dev [s] (~1 ms)
 
     % Timing of the synthetic data sources.
     TIMING.dt_predict = 0.01;          % [s]
-    TIMING.dt_camera  = 0.033;         % [s]
-    TIMING.axle_dt_range = [];  % legacy field, not used in rotation-triggered mode
+    TIMING.axle_dt_range = [];  % legacy field
     TIMING.T_end = 10;                 % [s]
 
     dt_sim = TIMING.dt_predict;
     t_sim  = 0:dt_sim:TIMING.T_end;
     N      = length(t_sim);
 
-    % Steering and acceleration profiles define the simulated path.
-    %delta_true = 0.3 * sin(2*pi*0.2*t_sim);
-    delta_true = 0*ones(size(t_sim));
-    
-    a_long_true = 0.8 * ones(size(t_sim));
-    a_long_true(t_sim > 5 & t_sim < 7) = -2.5;
+    % PWM command profiles (what your controller sends).
+    pwm_throttle = 1500 * ones(size(t_sim));
+    pwm_steer    = 1500 * ones(size(t_sim));
+
+    pwm_throttle(t_sim >= 0.8 & t_sim < 3.0) = 1720;
+    pwm_throttle(t_sim >= 3.0 & t_sim < 5.3) = 1825;
+    pwm_throttle(t_sim >= 5.3 & t_sim < 6.7) = 1500;   % coast to stop
+    pwm_throttle(t_sim >= 6.7 & t_sim < 8.5) = 1150;   % strong reverse
+    pwm_throttle(t_sim >= 8.5) = 1500;
+
+    pwm_steer(t_sim >= 1.5 & t_sim < 3.4) = 1830;
+    pwm_steer(t_sim >= 3.4 & t_sim < 5.1) = 1200;
+    pwm_steer(t_sim >= 5.1 & t_sim < 6.2) = 1700;
+    pwm_steer(t_sim >= 6.2 & t_sim < 8.6) = 1500;
+    pwm_steer(t_sim >= 8.6) = 1320;
+
+    % True steering angle and acceleration are generated from PWM through
+    % separate tuneable functions/dynamics.
+    delta_true  = zeros(1, N);
+    delta_dot   = 0;
+    a_long_true = zeros(1, N);
 
     % Integrate the bicycle model to create the ground-truth trajectory.
     x_true = zeros(4, N);
     x_true(:,1) = [0; 0; 0; 0];
     for k = 1:N-1
+        [delta_true(k), delta_dot] = steering_actuator_step( ...
+            delta_true(k), delta_dot, pwm_steer(k), dt_sim, PLANT.steer);
+
+        a_long_true(k) = throttle_pwm_to_accel(pwm_throttle(k), ...
+            x_true(4, k), PLANT.throttle);
+
         x_true(:,k+1) = bicycle_step(x_true(:,k), ...
             delta_true(k), a_long_true(k), dt_sim, PLANT);
+
+        delta_true(k+1) = delta_true(k);
     end
+    a_long_true(N) = a_long_true(N-1);
 
-    % Camera measurements at a fixed rate.
-    cam_period = max(1, round(TIMING.dt_camera / dt_sim));
-    cam_idx  = 1:cam_period:N;
-    z_cam    = x_true(1:3, cam_idx) + ...
-        diag([SENSOR.r_cam_xy; SENSOR.r_cam_xy; SENSOR.r_cam_theta]) * randn(3, length(cam_idx));
-
-    % Axle speed measurements are event-driven: one sample per sensor revolution.
-    % This makes sample interval inversely proportional to speed.
-    axle_idx = [];
-    theta_sensor = 0;  % integrated sensor angle [rad]
+    % Wheel-rotation odometry events: one sample per full wheel rotation.
+    wheel_rot_count_per_step = zeros(1, N);
+    wheel_rot_dir_per_step = zeros(1, N);
+    accum_distance = 0;
     for k = 2:N
-        omega_sensor = abs(x_true(4, k-1)) / PLANT.speed_ratio;  % [rad/s]
-        theta_sensor = theta_sensor + omega_sensor * dt_sim;
-        while theta_sensor >= 2*pi
-            axle_idx(end+1) = k; %#ok<SAGROW>
-            theta_sensor = theta_sensor - 2*pi;
+        ds = x_true(4, k-1) * dt_sim;
+        accum_distance = accum_distance + abs(ds);
+        while accum_distance >= PLANT.pulse_distance
+            wheel_rot_count_per_step(k) = wheel_rot_count_per_step(k) + 1;
+            wheel_rot_dir_per_step(k) = sign(x_true(4, k-1));
+            accum_distance = accum_distance - PLANT.pulse_distance;
         end
     end
-    axle_idx = unique(axle_idx, 'stable');
-    axle_times = t_sim(axle_idx);
+    wheel_rot_idx = find(wheel_rot_count_per_step > 0);
+    wheel_rot_count = wheel_rot_count_per_step(wheel_rot_idx);
+    wheel_rot_dir = wheel_rot_dir_per_step(wheel_rot_idx);
+    wheel_rot_times = t_sim(wheel_rot_idx);
 
-    omega_true = abs(x_true(4, axle_idx)) / PLANT.speed_ratio;
-    z_axle     = abs(omega_true + SENSOR.r_omega * randn(size(omega_true)));
+    wheel_rot_dt_true = nan(size(wheel_rot_times));  % true inter-pulse interval [s]
+    wheel_rot_dt_meas = nan(size(wheel_rot_times));  % noisy measured interval [s]
+    wheel_rot_ds_true = zeros(size(wheel_rot_times));  % signed true travel [m]
+    for i = 1:length(wheel_rot_times)
+        if i >= 2
+            dt_rot = wheel_rot_times(i) - wheel_rot_times(i-1);
+            wheel_rot_dt_true(i) = dt_rot;
+            % Noise is on the timestamp — distance per pulse is exact.
+            wheel_rot_dt_meas(i) = dt_rot + SENSOR.r_wheel_dt * randn();
+            wheel_rot_dt_meas(i) = max(wheel_rot_dt_meas(i), 1e-4); % clamp positive
+        end
+        ds_rot = wheel_rot_dir(i) * wheel_rot_count(i) * PLANT.pulse_distance;
+        wheel_rot_ds_true(i) = ds_rot;
+    end
+
+    % Legacy compatibility fields (if older scripts still expect them).
+    axle_idx = wheel_rot_idx;
+    axle_times = wheel_rot_times;
+    omega_true = abs(x_true(4, axle_idx)) / max(PLANT.r_w, 1e-6);
+    z_axle = omega_true;
 
     sim_data = struct( ...
         'plant', PLANT, ...
@@ -83,11 +130,17 @@ function sim_data = generate_kalman_data(output_file)
         'timing', TIMING, ...
         'dt_sim', dt_sim, ...
         't_sim', t_sim, ...
+        'pwm_throttle', pwm_throttle, ...
+        'pwm_steer', pwm_steer, ...
         'delta_true', delta_true, ...
         'a_long_true', a_long_true, ...
         'x_true', x_true, ...
-        'cam_idx', cam_idx, ...
-        'z_cam', z_cam, ...
+        'wheel_rot_idx', wheel_rot_idx, ...
+        'wheel_rot_count', wheel_rot_count, ...
+        'wheel_rot_times', wheel_rot_times, ...
+        'wheel_rot_dt_true', wheel_rot_dt_true, ...
+        'wheel_rot_dt_meas', wheel_rot_dt_meas, ...
+        'wheel_rot_ds_true', wheel_rot_ds_true, ...
         'axle_times', axle_times, ...
         'axle_idx', axle_idx, ...
         'omega_true', omega_true, ...
@@ -102,46 +155,40 @@ end
 function plot_generated_data(sim_data)
     t_sim = sim_data.t_sim;
     x_true = sim_data.x_true;
+    pwm_throttle = sim_data.pwm_throttle;
+    pwm_steer = sim_data.pwm_steer;
     delta_true = sim_data.delta_true;
-    a_long_true = sim_data.a_long_true;
-    cam_idx = sim_data.cam_idx;
-    z_cam = sim_data.z_cam;
-    axle_times = sim_data.axle_times;
-    z_axle = sim_data.z_axle;
-    v_axle = z_axle * sim_data.plant.speed_ratio;
+    rot_times = sim_data.wheel_rot_times;
 
     figure('Name', 'Generated Kalman Dataset', 'Position', [120 120 1300 850]);
 
     subplot(2,3,1); hold on; grid on;
     plot(x_true(1,:), x_true(2,:), 'k-', 'LineWidth', 1.5);
-    plot(z_cam(1,:), z_cam(2,:), 'r.', 'MarkerSize', 5);
-    xlabel('X [m]'); ylabel('Y [m]'); title('Ground Truth and Camera Samples');
-    legend('True trajectory', 'Camera samples');
+    xlabel('X [m]'); ylabel('Y [m]'); title('Ground Truth Trajectory');
+    legend('True trajectory');
     axis equal;
 
     subplot(2,3,2); hold on; grid on;
-    plot(t_sim, rad2deg(delta_true), 'b-', 'LineWidth', 1.2);
-    xlabel('t [s]'); ylabel('\delta [deg]'); title('Steering Input');
+    plot(t_sim, pwm_steer, 'b-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('PWM [us]'); title('Steering PWM Command');
 
     subplot(2,3,3); hold on; grid on;
-    plot(t_sim, a_long_true, 'm-', 'LineWidth', 1.2);
-    xlabel('t [s]'); ylabel('a_{long} [m/s^2]'); title('Acceleration Input');
+    plot(t_sim, pwm_throttle, 'm-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('PWM [us]'); title('Throttle PWM Command');
 
     subplot(2,3,4); hold on; grid on;
-    plot(t_sim, x_true(4,:), 'k-', 'LineWidth', 1.2);
-    plot(axle_times, v_axle, 'r.', 'MarkerSize', 6);
-    xlabel('t [s]'); ylabel('v [m/s]'); title('Speed and Axle-Speed Samples');
-    legend('True speed', 'Measured |v|');
+    stem(rot_times(2:end), sim_data.wheel_rot_dt_meas(2:end)*1000, 'r.', 'MarkerSize', 6);
+    plot(rot_times(2:end), sim_data.wheel_rot_dt_true(2:end)*1000, 'k-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('\Delta t [ms]'); title('Inter-pulse Interval (true vs measured)');
+    legend('Measured \Delta t', 'True \Delta t');
 
     subplot(2,3,5); hold on; grid on;
-    plot(t_sim, rad2deg(x_true(3,:)), 'k-', 'LineWidth', 1.2);
-    plot(t_sim(cam_idx), rad2deg(z_cam(3,:)), 'r.', 'MarkerSize', 5);
-    xlabel('t [s]'); ylabel('\theta [deg]'); title('Heading and Camera Heading');
-    legend('True heading', 'Measured heading');
+    plot(t_sim, rad2deg(delta_true), 'k-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('\delta [deg]'); title('Steering Angle (Actuator Output)');
 
     subplot(2,3,6); hold on; grid on;
-    stairs([0, axle_times], [0, diff([0, axle_times])], 'b-', 'LineWidth', 1.2);
-    xlabel('t [s]'); ylabel('\Delta t [s]'); title('Axle Sensor Inter-arrival Time');
+    stairs([0, rot_times], [0, diff([0, rot_times])], 'b-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('\Delta t [s]'); title('Wheel-Rotation Inter-arrival Time');
 
     sgtitle('Synthetic Dataset Summary for EKF Tuning');
 end
@@ -158,6 +205,25 @@ function x_next = bicycle_step(x, delta, a_long, dt, C)
         wrap_pi(theta + (v / C.L) * tan(delta) * dt)
         v     + a_long * dt
     ];
+end
+
+function [delta_next, delta_dot_next] = steering_actuator_step(delta, delta_dot, pwm_us, dt, steer_cfg)
+    delta_target = steering_pwm_to_target_angle(pwm_us, steer_cfg.max_angle_deg);
+
+    delta_ddot = steer_cfg.wn^2 * (delta_target - delta) ...
+        - 2 * steer_cfg.zeta * steer_cfg.wn * delta_dot;
+
+    delta_dot_next = delta_dot + delta_ddot * dt;
+    max_rate = deg2rad(steer_cfg.max_rate_deg_s);
+    delta_dot_next = clamp(delta_dot_next, -max_rate, max_rate);
+
+    delta_next = delta + delta_dot_next * dt;
+    max_delta = deg2rad(steer_cfg.max_angle_deg);
+    delta_next = clamp(delta_next, -max_delta, max_delta);
+end
+
+function y = clamp(x, lo, hi)
+    y = min(max(x, lo), hi);
 end
 
 function a = wrap_pi(a)

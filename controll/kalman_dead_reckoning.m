@@ -2,7 +2,7 @@
 % ============================================================
 %
 % This is the dead-reckoning variant: position and heading are estimated
-% purely from the kinematic bicycle model + axle speed sensor.
+% purely from the kinematic bicycle model + wheel-rotation odometry.
 % There is NO external position/heading correction.
 %
 % STATE:   x = [X; Y; theta; v]
@@ -11,15 +11,15 @@
 %   v      : longitudinal speed [m/s] (+ forward, - reverse)
 %
 % INPUTS (control, known at every predict step):
-%   delta  : front-wheel steering angle [rad]
-%   a_long : longitudinal acceleration [m/s^2]
+%   pwm_throttle : ESC PWM command [us], 1000..2000
+%   pwm_steer    : steering PWM command [us], 1000..2000
 %
-% MEASUREMENTS (only axle speed, variable rate):
-%   Axle speed  : |omega_axle| [rad/s]  (ABSOLUTE — no sign)
+% MEASUREMENTS (wheel-rotation events, variable rate):
+%   ds_wheel : UNSIGNED distance increment per event [m]
+%              Direction is inferred from the estimated velocity sign.
 %
 % WARNING: Without an external position/heading reference, drift in
-% X, Y, and theta will grow unboundedly over time.  The axle speed
-% sensor only constrains the speed state.  This variant is suitable
+% X, Y, and theta will grow unboundedly over time. This variant is suitable
 % for short-duration runs or as a fallback when the camera is lost.
 %
 % ============================================================
@@ -40,11 +40,15 @@ sim_data = loaded.sim_data;
 CONST.L   = sim_data.plant.L;    % wheelbase [m]
 CONST.r_w = sim_data.plant.r_w;  % wheel radius [m]
 CONST.W   = sim_data.plant.W;    % track width [m] (info only)
+CONST.wheel_circumference = sim_data.plant.wheel_circumference;
+CONST.pulse_distance       = sim_data.plant.pulse_distance;
 
-% --- Speed Sensor Conversion ---
-%   Sensor spins 3x faster than the wheel.
-CONST.gear_ratio = sim_data.plant.gear_ratio;        % sensor speed / wheel speed [-]
-CONST.speed_ratio = sim_data.plant.speed_ratio;      % [m/rad]
+% --- Control-to-dynamics mapping ---
+CONST.throttle = sim_data.plant.throttle;
+CONST.steer    = sim_data.plant.steer;
+
+% --- Wheel timing noise ---
+CONST.r_wheel_dt = sim_data.sensor.r_wheel_dt;  % [s]
 
 % --- Process Noise Std Dev (continuous-time-like; scaled by dt inside) ---
 %   For dead reckoning you may want LOWER process noise to trust the
@@ -53,15 +57,9 @@ CONST.q_pos   = 0.02;   % position  [m/s]
 CONST.q_theta = 0.05;   % heading   [rad/s]
 CONST.q_v     = 1.0;    % velocity  [m/s^2]
 
-% --- Axle Speed Sensor Noise Std Dev ---
-CONST.r_omega = 0.5;    % angular speed [rad/s]
-
-% --- Absolute-speed Jacobian smoothing ---
-CONST.eps_v = 1e-3;     % [m/s]
-
 % --- Timing (for simulation only; real system uses actual dt) ---
 CONST.dt_predict = sim_data.timing.dt_predict;       % EKF prediction period  [s]
-CONST.axle_dt_range = sim_data.timing.axle_dt_range; % axle sensor inter-arrival [s]
+CONST.axle_dt_range = sim_data.timing.axle_dt_range; % legacy field
 
 %% =================== INITIAL STATE & COVARIANCE ===================
 x_est = [0; 0; 0; 0];                          % initial state estimate
@@ -75,11 +73,14 @@ N      = length(t_sim);
 delta_true  = sim_data.delta_true;
 a_long_true = sim_data.a_long_true;
 x_true      = sim_data.x_true;
+pwm_throttle = sim_data.pwm_throttle;
+pwm_steer    = sim_data.pwm_steer;
 
 %% =================== GENERATE NOISY MEASUREMENTS ===================
-axle_times = sim_data.axle_times;
-axle_idx   = sim_data.axle_idx;
-z_axle     = sim_data.z_axle;
+wheel_rot_times = sim_data.wheel_rot_times;
+wheel_rot_idx   = sim_data.wheel_rot_idx;
+wheel_rot_count = sim_data.wheel_rot_count;     % pulses per event
+wheel_rot_dt_meas = sim_data.wheel_rot_dt_meas;  % noisy inter-pulse intervals [s]
 
 %% =================== RUN THE EKF (dead reckoning) ===================
 x_hist = zeros(4, N);
@@ -87,18 +88,36 @@ P_diag = zeros(4, N);
 x_hist(:,1) = x_est;
 P_diag(:,1) = diag(P_est);
 
-axle_ptr = 1;
+rot_ptr = 1;
+delta_est = 0;
+delta_dot_est = 0;
+wheel_v_meas_log = nan(size(wheel_rot_times));
 
 for k = 2:N
     % ---- 1) PREDICT ----
-    u = [delta_true(k-1); a_long_true(k-1)];
+    [delta_est, delta_dot_est] = steering_actuator_step( ...
+        delta_est, delta_dot_est, pwm_steer(k-1), dt_sim, CONST.steer);
+    a_cmd = throttle_pwm_to_accel(pwm_throttle(k-1), x_est(4), CONST.throttle);
+
+    u = [delta_est; a_cmd];
     [x_est, P_est] = ekf_predict(x_est, P_est, u, dt_sim, CONST);
 
-    % ---- 2) AXLE SPEED UPDATE (if sample available) ----
-    if axle_ptr <= length(axle_idx) && k == axle_idx(axle_ptr)
-        [x_est, P_est] = ekf_update_axle_speed(x_est, P_est, ...
-            z_axle(axle_ptr), CONST);
-        axle_ptr = axle_ptr + 1;
+    % ---- 2) WHEEL PULSE — speed measurement update ----
+    % Distance per pulse is exact (fixed geometry); all noise is on the timestamp.
+    % v = pulse_distance / dt_meas
+    % By error propagation: sigma_v = (pulse_distance / dt_meas^2) * sigma_dt
+    if rot_ptr <= length(wheel_rot_idx) && k == wheel_rot_idx(rot_ptr)
+        dt_meas = wheel_rot_dt_meas(rot_ptr);
+        if ~isnan(dt_meas) && dt_meas > 1e-4
+            ds = wheel_rot_count(rot_ptr) * CONST.pulse_distance;
+            v_unsigned = ds / dt_meas;
+            v_meas = sign(x_est(4)) * v_unsigned;
+            sigma_v = (ds / dt_meas^2) * CONST.r_wheel_dt;
+            R_v = sigma_v^2;
+            [x_est, P_est] = ekf_update_speed(x_est, P_est, v_meas, R_v);
+            wheel_v_meas_log(rot_ptr) = v_meas;
+        end
+        rot_ptr = rot_ptr + 1;
     end
 
     % ---- Store ----
@@ -145,11 +164,10 @@ legend('True','EKF','\pm1\sigma');
 subplot(2,3,5); hold on; grid on;
 plot(t_sim, x_true(4,:), 'k-', 'LineWidth', 1.2);
 plot(t_sim, x_hist(4,:), 'b--');
-v_meas_pts = z_axle .* CONST.speed_ratio;
-plot(axle_times, v_meas_pts, 'r.', 'MarkerSize', 4);
+plot(wheel_rot_times, wheel_v_meas_log, 'r.', 'MarkerSize', 5);
 fill_sigma(t_sim, x_hist(4,:), sqrt(P_diag(4,:)), [0.5 0.5 1]);
 xlabel('t [s]'); ylabel('v [m/s]'); title('Speed');
-legend('True','EKF','|v| meas','\pm1\sigma');
+legend('True','EKF','Pulse meas','\pm1\sigma');
 
 % --- Covariance growth (position) ---
 subplot(2,3,6); hold on; grid on;
@@ -172,7 +190,7 @@ fprintf('  Position Y : %.4f m\n', rmse_y);
 fprintf('  Heading    : %.4f rad (%.2f deg)\n', rmse_theta, rad2deg(rmse_theta));
 fprintf('  Speed      : %.4f m/s\n', rmse_v);
 fprintf('\nNote: Position/heading RMSE will grow over time (no corrections).\n');
-fprintf('Speed RMSE should remain bounded (axle sensor constrains it).\n');
+fprintf('Wheel increments directly advance pose by measured arc length.\n');
 
 %% =====================================================================
 %%                       LOCAL FUNCTIONS
@@ -205,33 +223,40 @@ function [x_p, P_p] = ekf_predict(x, P, u, dt, C)
     P_p = F * P * F' + Q;
 end
 
-function [x_u, P_u] = ekf_update_axle_speed(x, P, omega_meas, C)
-    v   = x(4);
-    sr  = C.speed_ratio;
-    eps = C.eps_v;
-
-    v_abs  = sqrt(v^2 + eps^2);
-    h_pred = v_abs / sr;
-
-    dh_dv = v / (v_abs * sr);
-    H = [0, 0, 0, dh_dv];
-
-    R = C.r_omega^2;
-
-    y_inn = omega_meas - h_pred;
-
-    S = H * P * H' + R;
+function [x_u, P_u] = ekf_update_speed(x, P, v_meas, R_v)
+    % Standard Kalman measurement update for the speed state only.
+    % Heading is NOT changed — this is the fix for the heading scaling bug.
+    H = [0, 0, 0, 1];
+    y_inn = v_meas - x(4);
+    S = H * P * H' + R_v;
     K = (P * H') / S;
-
     x_u = x + K * y_inn;
-
     I4 = eye(4);
     ImKH = I4 - K * H;
-    P_u = ImKH * P * ImKH' + K * R * K';
+    P_u = ImKH * P * ImKH' + K * R_v * K';
+end
+
+function [delta_next, delta_dot_next] = steering_actuator_step(delta, delta_dot, pwm_us, dt, steer_cfg)
+    delta_target = steering_pwm_to_target_angle(pwm_us, steer_cfg.max_angle_deg);
+
+    delta_ddot = steer_cfg.wn^2 * (delta_target - delta) ...
+        - 2 * steer_cfg.zeta * steer_cfg.wn * delta_dot;
+
+    delta_dot_next = delta_dot + delta_ddot * dt;
+    max_rate = deg2rad(steer_cfg.max_rate_deg_s);
+    delta_dot_next = clamp(delta_dot_next, -max_rate, max_rate);
+
+    delta_next = delta + delta_dot_next * dt;
+    max_delta = deg2rad(steer_cfg.max_angle_deg);
+    delta_next = clamp(delta_next, -max_delta, max_delta);
 end
 
 function a = wrap_pi(a)
     a = mod(a + pi, 2*pi) - pi;
+end
+
+function y = clamp(x, lo, hi)
+    y = min(max(x, lo), hi);
 end
 
 function fill_sigma(t, mu, sigma, col)

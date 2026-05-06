@@ -441,29 +441,29 @@ mod app {
     #[task(local = [us0, us1, us2], priority = 1)]
     async fn ultrasound_scan(ctx: ultrasound_scan::Context) -> ! {
         use defmt::{info, warn};
-        // 50 ms timeout covers the maximum HC-SR04 echo pulse (~38 ms at ~6.5 m).
         const TIMEOUT_US: u64 = 50_000;
+        const INTER_SENSOR_DELAY_US: u64 = 60_000;
         let mut next = MainMono::now();
         loop {
             match ctx.local.us0.measure::<MainMono>(TIMEOUT_US.micros()).await {
                 Ok(ticks) => info!("us0: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us0: timeout"),
             }
-            next = next + 60_000u64.micros();
+            next = next + INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
             match ctx.local.us1.measure::<MainMono>(TIMEOUT_US.micros()).await {
                 Ok(ticks) => info!("us1: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us1: timeout"),
             }
-            next = next + 60_000u64.micros();
+            next = next + INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
             match ctx.local.us2.measure::<MainMono>(TIMEOUT_US.micros()).await {
                 Ok(ticks) => info!("us2: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us2: timeout"),
             }
-            next = next + 60_000u64.micros();
+            next = next + INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
         }
     }

@@ -164,6 +164,16 @@ This would measure the same thing with **~1 µs ISR-entry jitter** — totally i
 
 In a real product, you'd use the simple `MainMono` approach. Here, consider this a **pedagogical over-engineered masterpiece** — proof that just because you *can* measure something to ±1 µs doesn't mean you *should*.
 
+**But wait — it gets better.** At the default 150 MHz system clock, each counter tick represents one clock period:
+
+$$\frac{c}{150\,\text{MHz}} = \frac{3 \times 10^8\,\text{m/s}}{150 \times 10^6\,\text{Hz}} \approx 1.9986\,\text{m}$$
+
+That's right: **this counter has a time resolution that corresponds to ~2 metres of light travel distance per tick.** If you somehow connected it to a photon detector, the HC-SR04 PWM measuring infrastructure would be accurate enough to... resolve distances to the nearest two metres. Using light. A sensor that costs €0.40 and has a ±3 mm acoustic error budget.
+
+Overclock the RP2350 to 400 MHz (which it handles) and the resolution improves to ~0.75 m per tick — still completely useless for light, but an impressive spec sheet entry. In practice, parasitic capacitance in PCB traces and pin drivers would make any real photon-timing application impossible, but that is entirely beside the point.
+
+**THE OVER-ENGINEERED SOLUTION IS A MASTERPIECE.**
+
 ### `ultrasound_scan` task
 
 The `ultrasound_scan` async task (priority 1) polls all three sensors in a round-robin loop with 60 ms between each measurement start:

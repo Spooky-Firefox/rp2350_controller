@@ -57,18 +57,18 @@ impl SensorEvent {
         }
     }
 
-    /// Create a distance sensor event with 3 distance measurements [mm].
+    /// Create a distance sensor event with 3 distance measurements [cm].
     pub fn distances(
         timestamp_us: u64,
         setpoint_mps: f32,
-        distance_1_mm: f32,
-        distance_2_mm: f32,
-        distance_3_mm: f32,
+        distance_1_cm: f32,
+        distance_2_cm: f32,
+        distance_3_cm: f32,
     ) -> Self {
         Self {
             t32_us: timestamp_us as u32,
             setpoint_mps,
-            values: [distance_1_mm, distance_2_mm, distance_3_mm, f32::INFINITY],
+            values: [distance_1_cm, distance_2_cm, distance_3_cm, f32::INFINITY],
         }
     }
 

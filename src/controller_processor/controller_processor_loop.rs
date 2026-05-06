@@ -1,11 +1,12 @@
 //! Core 1 event loop for sensor processing and control.
 #![deny(unsafe_code)]
 
-use crate::controller_processor::controller::{Controller, StraightLineSpeedController};
+use crate::controller_processor::controller::{Controller, StraightLineSpeedController, SteeringDistanceController};
 use crate::controller_processor::kalman_filter;
 use crate::ipc::{self, ControlEvent, SensorEvent, TimeExtender};
 
 use core::f32::consts::PI;
+use defmt::info;
 use fugit::TimerInstantU64;
 use rp235x_hal as hal;
 
@@ -63,11 +64,28 @@ pub fn core1_task() -> ! {
         last_derivative: 0.0,
     };
 
+    // ── Steering Distance Controller ─────────────────────────────────────
+    let mut distance_controller = SteeringDistanceController {
+        kp: 50.0,
+        ki: 2.0,
+        kd: 5.0,
+        integral_error: 0.0,
+        previous_error: 0.0,
+        integral_limit: 100.0,
+        neutral_steering_pwm_us: 1500,
+        min_distance_cm: 30.0, // Activate steering if center sensor < 30cm
+        last_error: 0.0,
+        last_proportional: 0.0,
+        last_integral: 0.0,
+        last_derivative: 0.0,
+    };
+
     // Filter is lazily initialised on the first event so that t0 is correct.
     let mut filter: Option<kalman_filter::EkfFilter> = None;
     let mut time_ext = TimeExtender::new();
     let mut last_control_time_us: Option<u64> = None;
     let mut last_setpoint_bits = f32::INFINITY.to_bits();
+    let mut last_distance_pwm_us: u16 = 1500;
 
     // ── Main event loop ──────────────────────────────────────────────────
     loop {
@@ -84,24 +102,62 @@ pub fn core1_task() -> ! {
                 last_setpoint_bits = event.setpoint_mps.to_bits();
             }
 
-            // Lazy-init filter on first event.
-            let filt = filter
-                .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
+            // Check if this is a distance sensor event or a speed/encoder event
+            // Distance events: values[2] is finite (3 distance measurements)
+            // Speed events: values[2] is INFINITY
+            let is_distance_event = event.values[2].is_finite();
 
-            process_event(filt, &event, now);
-            let speed = LENGTH_PER_HAL_RISE_METERS / (event.values[1] * 1e-6); // Convert encoder period → speed for controller input.
-            // Run the controller and send result back to Core 0.
-            let [steer_pwm_us, power_pwm_us] = controller.update(speed, dt_s);
-            channel.send_control_event_blocking(&ControlEvent::Pid {
-                error: controller.last_error,
-                proportional: controller.last_proportional,
-                integral: controller.last_integral,
-                derivative: controller.last_derivative,
-            });
-            channel.send_control_event_blocking(&ControlEvent::Control {
-                steer_pwm_us,
-                power_pwm_us,
-            });
+            if is_distance_event {
+                // ── Handle Distance Sensor Event ──────────────────────────────
+                let dist_left_cm = event.values[0];
+                let dist_center_cm = event.values[1];
+                let dist_right_cm = event.values[2];
+
+                // Run the distance-based steering controller
+                let steering_pwm = distance_controller.update(dist_left_cm, dist_center_cm, dist_right_cm, dt_s);
+                last_distance_pwm_us = steering_pwm;
+
+                info!(
+                    "Distance steering: L={} cm, C={} cm, R={} cm, PWM={} us, error={}",
+                    dist_left_cm as i32,
+                    dist_center_cm as i32,
+                    dist_right_cm as i32,
+                    steering_pwm,
+                    distance_controller.last_error as i32
+                );
+
+                // Send steering telemetry
+                channel.send_control_event_blocking(&ControlEvent::Pid {
+                    error: distance_controller.last_error,
+                    proportional: distance_controller.last_proportional,
+                    integral: distance_controller.last_integral,
+                    derivative: distance_controller.last_derivative,
+                });
+            } else {
+                // ── Handle Speed/Encoder Event ────────────────────────────────
+                // Lazy-init filter on first event.
+                let filt = filter
+                    .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
+
+                process_event(filt, &event, now);
+                let speed = LENGTH_PER_HAL_RISE_METERS / (event.values[1] * 1e-6); // Convert encoder period → speed for controller input.
+                // Run the controller and send result back to Core 0.
+                let [_steer_pwm_us, power_pwm_us] = controller.update(speed, dt_s);
+
+                // Use steering PWM from distance controller if available, otherwise neutral
+                let steer_pwm_us = last_distance_pwm_us;
+
+                channel.send_control_event_blocking(&ControlEvent::Pid {
+                    error: controller.last_error,
+                    proportional: controller.last_proportional,
+                    integral: controller.last_integral,
+                    derivative: controller.last_derivative,
+                });
+                channel.send_control_event_blocking(&ControlEvent::Control {
+                    steer_pwm_us,
+                    power_pwm_us,
+                });
+            }
         } else {
             // No data available — sleep until the other core signals via SEV.
             cortex_m::asm::wfe();

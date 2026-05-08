@@ -39,10 +39,10 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
 | `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, sends `SensorEvent` to Core 1 |
-| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Sends a timeout event to Core 1 so the filter can coast |
+| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
 | `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
-| `sio_interrupt` | Core 1 writes to FIFO | Receives `ControlEvent` and applies PWM outputs |
+| `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
 | `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
 | `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
 | `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
@@ -71,14 +71,53 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
 
 ### Inter-Core Communication (IPC)
 
-The two cores talk through a **32-bit hardware FIFO** built into the RP2350's SIO peripheral. Each core has its own TX and RX side — data written by one core appears on the other's read side.
+The two cores share data through **`heapless::spsc` lock-free queues**. The SIO hardware FIFO carries only lightweight 1-word **signal values** (`IpcSignal`) that tell the receiving core which queue to read from — no bulk data crosses the FIFO.
 
-| Direction | Message | Size | Content |
-| --------- | ------- | ---- | ------- |
-| Core 0 → Core 1 | `SensorEvent` | 6 words | timestamp, speed setpoint, steering, encoder period |
-| Core 1 → Core 0 | `ControlEvent` | 1 word | steering PWM + power PWM packed into 16 bits each |
+```text
+ Core 0                                            Core 1
+ ──────────────────────────────────────────────────────────
+ sensor_q (Producer) ──── SensorEvent ──► sensor_q (Consumer)
+                    SIO FIFO: SensorReady ──►
 
-The `FifoChannel` struct owns the `SioFifo` from the HAL, so all FIFO access is safe — no raw pointer manipulation. See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on what Core 1 does with these events.
+ control_q (Consumer) ◄─ ControlOutput ── control_q (Producer)
+ log_q (Consumer)     ◄─── LogData ─────  log_q (Producer)
+                    ◄── SIO FIFO: ControlReady / LogReady
+```
+
+#### Signal variants (`IpcSignal`, `#[repr(u32)]`)
+
+| Value | Name | Direction | Meaning |
+| ----- | ---- | --------- | ------- |
+| `1` | `SensorReady` | Core 0 → Core 1 | A `SensorEvent` was pushed to `sensor_q` |
+| `2` | `ControlReady` | Core 1 → Core 0 | A `ControlOutput` was pushed to `control_q` |
+| `3` | `LogReady` | Core 1 → Core 0 | A `LogData` was pushed to `log_q` |
+
+#### Queues
+
+| Queue | Type | Depth | Producer | Consumer |
+| ----- | ---- | ----- | -------- | -------- |
+| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`) | Core 1 |
+| `control_q` | `ControlOutput` | 4 | Core 1 | Core 0 (`sio_interrupt`) |
+| `log_q` | `LogData` | 128 | Core 1 | Core 0 (`log_data`) |
+
+#### Why SPSC queues instead of raw FIFO?
+
+The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlEvent` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
+
+#### Why is `FifoTx` / `FifoRx` split?
+
+On Core 0, the two FIFO halves live in **separate RTIC shared resources** so they get different priority ceilings:
+
+- `fifo_tx` — ceiling 3 (shared with `gpio_interrupt` and `sensor_timeout`)
+- `fifo_rx` — ceiling 4 (exclusive to `sio_interrupt`)
+
+This ensures `sio_interrupt` (priority 4) is never priority-ceiling-blocked by a lower-priority task that holds the TX lock, which would stall Core 1.
+
+#### Queue lifetimes — no `static mut` needed
+
+The queues are declared as `init` locals in the RTIC `init` function. RTIC places those locals in static storage, so `.split()` yields `'static` producers/consumers that can be moved directly into the `core1.spawn(...)` closure — no `unsafe` global state required.
+
+See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on what Core 1 does with sensor events.
 
 ---
 

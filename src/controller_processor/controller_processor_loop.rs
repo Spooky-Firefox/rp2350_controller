@@ -3,10 +3,12 @@
 
 use crate::controller_processor::controller::{Controller, StraightLineSpeedController};
 use crate::controller_processor::kalman_filter;
-use crate::ipc::{self, ControlEvent, SensorEvent, TimeExtender};
+use crate::ipc::{self, IpcSignal, SensorEvent, TimeExtender};
+use crate::logging::LogData;
 
 use core::f32::consts::PI;
 use fugit::TimerInstantU64;
+use heapless::spsc::{Consumer, Producer};
 use rp235x_hal as hal;
 
 /// Arc length per encoder magnet pulse [m].
@@ -16,7 +18,11 @@ const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
 /// `core.spawn(...)`.  Runs a blocking event loop that never returns.
 ///
 /// This module does not deny unsafe, as it must steal the PAC SIO peripheral.
-pub fn core1_task() -> ! {
+pub fn core1_task(
+    mut sensor_q_rx: Consumer<'static, ipc::SensorEvent, 4>,
+    mut control_q_tx: Producer<'static, ipc::ControlOutput, 4>,
+    mut log_q_tx: Producer<'static, LogData, 128>,
+) -> ! {
     // Core 1 steals the PAC peripheral (Peripherals::steal()). This is the standard
     // pattern on RP2350 because SIO is per-core hardware: each core has its own SIO view.
     // Safe because: (1) PAC prevents multi-core data races (SIO regs are not shared),
@@ -24,10 +30,10 @@ pub fn core1_task() -> ! {
     // own SIO address space, mapped by the hardware to the executing core.
     #[allow(unsafe_code)]
     let sio = hal::Sio::new(unsafe { rp235x_pac::Peripherals::steal() }.SIO);
-    let mut channel = ipc::FifoChannel::new(sio.fifo);
+    let mut fifo = sio.fifo;
 
     // Drain any stale FIFO data left over from boot / previous run.
-    channel.drain();
+    fifo.drain();
 
     // ── Kalman filter constants ──────────────────────────────────────────
     let kalman_const = kalman_filter::EkfConst {
@@ -72,7 +78,11 @@ pub fn core1_task() -> ! {
 
     // ── Main event loop ──────────────────────────────────────────────────
     loop {
-        if let Some(event) = channel.try_recv_sensor_event() {
+        // Block until Core 0 signals that new data is available.
+        let word = fifo.read_blocking();
+        if let Some(IpcSignal::SensorReady) = IpcSignal::from_u32(word)
+            && let Some(event) = sensor_q_rx.dequeue()
+        {
             let t_us = time_ext.extend(event.t32_us);
             let now = TimerInstantU64::<1_000_000>::from_ticks(t_us);
             let dt_s = last_control_time_us
@@ -89,48 +99,61 @@ pub fn core1_task() -> ! {
             let filt = filter
                 .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
 
-            process_event(filt, &event, now);
+            let measured_speed_mps = process_event(filt, &event, now);
             let distance_increment_m = if event.values[1].is_finite() && event.values[1] > 0.0 {
                 LENGTH_PER_HAL_RISE_METERS
             } else {
                 0.0
             };
-            // Run the controller and send result back to Core 0.
+
+            // Run the controller.
             let [steer_pwm_us, power_pwm_us] = controller.update(distance_increment_m, dt_s);
-            channel.send_control_event_blocking(&ControlEvent::Pid {
-                error: controller.last_error,
-                proportional: controller.last_proportional,
-                integral: controller.last_integral,
-                derivative: controller.last_derivative,
-            });
-            channel.send_control_event_blocking(&ControlEvent::Control {
-                steer_pwm_us,
-                power_pwm_us,
-            });
-        } else {
-            // No data available — sleep until the other core signals via SEV.
-            cortex_m::asm::wfe();
+
+            // Push log data and signal Core 0.
+            log_q_tx
+                .enqueue(LogData {
+                    timestamp: now,
+                    steer_value_ms: steer_pwm_us,
+                    throttle_value_ms: power_pwm_us,
+                    setpoint_value: event.setpoint_mps,
+                    error_value: controller.last_error,
+                    speed_value: measured_speed_mps,
+                    kalman_values: filt.state(),
+                })
+                .ok();
+            fifo.write_blocking(IpcSignal::LogReady as u32);
+
+            // Push control output and signal Core 0.
+            control_q_tx
+                .enqueue(ipc::ControlOutput {
+                    steer_pwm_us,
+                    power_pwm_us,
+                })
+                .ok();
+            fifo.write_blocking(IpcSignal::ControlReady as u32);
         }
     }
 }
 
 /// Dispatch a [`SensorEvent`] to the appropriate EKF entry point.
+/// Returns the measured longitudinal speed [m/s] (0.0 if no speed data).
 fn process_event(
     filter: &mut kalman_filter::EkfFilter,
     event: &SensorEvent,
     now: TimerInstantU64<1_000_000>,
-) {
+) -> f32 {
     let steer = event.values[0];
     let rpm_period_us = event.values[1];
 
     filter.set_control(steer, 0.0);
-    // Temporary fix to differentiate between "no data" and "data" events
     if rpm_period_us.is_finite() && rpm_period_us > 0.0 {
         // Convert encoder edge period [µs] → longitudinal speed [m/s].
         let period_s = rpm_period_us * 1e-6;
         let speed_mps = LENGTH_PER_HAL_RISE_METERS / period_s;
         filter.on_speed_sample(speed_mps, now);
+        speed_mps
     } else {
         filter.on_timeout(now);
+        0.0
     }
 }

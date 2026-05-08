@@ -5,18 +5,18 @@
 use defmt_rtt as _;
 use embedded_hal::digital::StatefulOutputPin;
 use fugit::{MicrosDurationU32, TimerDurationU32};
-use rp235x_hal as hal;
 use hal::gpio;
 use hal::multicore::Stack;
 use panic_probe as _;
-use usb_device::class_prelude::UsbBusAllocator;
-use usb_device::device::UsbDevice;
-use usbd_serial::SerialPort;
+use rp235x_hal as hal;
 use rp2350_controller::constants::*;
 use rp2350_controller::entry::entry;
 use rp2350_controller::ipc;
 use rp2350_controller::logging::LogData;
 use rp2350_controller::usb_serial::init_usb_serial;
+use usb_device::class_prelude::UsbBusAllocator;
+use usb_device::device::UsbDevice;
+use usbd_serial::SerialPort;
 
 type MyUsbBus = hal::usb::UsbBus;
 
@@ -75,6 +75,7 @@ mod app {
         last_sensor_irq_us: u64,
         fifo_tx: ipc::FifoTx,
         fifo_rx: ipc::FifoRx,
+        sensor_q_tx: heapless::spsc::Producer<'static, ipc::SensorEvent, 4>,
         power: u16,
     }
 
@@ -85,8 +86,8 @@ mod app {
         led: LedPin,
         _pwm_a_pin: MotorPwmPinA,
         _pwm_b_pin: MotorPwmPinB,
-        log_data_producer: heapless::spsc::Producer<'static, LogData, 128>,
         log_data_consumer: heapless::spsc::Consumer<'static, LogData, 128>,
+        control_q_rx: heapless::spsc::Consumer<'static, ipc::ControlOutput, 4>,
         us0: UsMeasure0,
         us1: UsMeasure1,
         us2: UsMeasure2,
@@ -100,6 +101,8 @@ mod app {
     #[init(local = [
         usb_bus: Option<UsbBusAllocator<MyUsbBus>> = None,
         dataQueue: heapless::spsc::Queue<LogData, 128> = heapless::spsc::Queue::new(),
+        sensor_q: heapless::spsc::Queue<ipc::SensorEvent, 4> = heapless::spsc::Queue::new(),
+        control_q: heapless::spsc::Queue<ipc::ControlOutput, 4> = heapless::spsc::Queue::new(),
         us0_shared: hc_sr04::HcSr04Shared = hc_sr04::HcSr04Shared::new(),
         us1_shared: hc_sr04::HcSr04Shared = hc_sr04::HcSr04Shared::new(),
         us2_shared: hc_sr04::HcSr04Shared = hc_sr04::HcSr04Shared::new(),
@@ -178,21 +181,22 @@ mod app {
         us_pwm6.set_div_int(150);
         let mut us_pwm7 = pwm_slices.pwm7;
         us_pwm7.set_div_int(150);
-        let (us0, us0_irq) = ctx.local.us0_shared.split(
-            pins.gpio14.into_push_pull_output(),
-            pins.gpio15,
-            us_pwm7,
-        );
-        let (us1, us1_irq) = ctx.local.us1_shared.split(
-            pins.gpio12.into_push_pull_output(),
-            pins.gpio13,
-            us_pwm6,
-        );
-        let (us2, us2_irq) = ctx.local.us2_shared.split(
-            pins.gpio10.into_push_pull_output(),
-            pins.gpio11,
-            us_pwm5,
-        );
+        let (us0, us0_irq) =
+            ctx.local
+                .us0_shared
+                .split(pins.gpio14.into_push_pull_output(), pins.gpio15, us_pwm7);
+        let (us1, us1_irq) =
+            ctx.local
+                .us1_shared
+                .split(pins.gpio12.into_push_pull_output(), pins.gpio13, us_pwm6);
+        let (us2, us2_irq) =
+            ctx.local
+                .us2_shared
+                .split(pins.gpio10.into_push_pull_output(), pins.gpio11, us_pwm5);
+
+        let (sensor_q_tx, sensor_q_rx) = ctx.local.sensor_q.split();
+        let (control_q_tx, control_q_rx) = ctx.local.control_q.split();
+        let (log_q_tx, log_q_rx) = ctx.local.dataQueue.split();
 
         // Spawn Core 1 for controller processing.
         {
@@ -201,7 +205,11 @@ mod app {
             let core1 = &mut cores[1];
             let stack = CORE1_STACK.take().unwrap();
             let _ = core1.spawn(stack, move || {
-                rp2350_controller::controller_processor::controller_processor_loop::core1_task();
+                rp2350_controller::controller_processor::controller_processor_loop::core1_task(
+                    sensor_q_rx,
+                    control_q_tx,
+                    log_q_tx,
+                );
             });
         }
 
@@ -213,7 +221,6 @@ mod app {
         sensor_timeout::spawn().unwrap();
         periodic_drain_log_data::spawn().unwrap();
         ultrasound_scan::spawn().unwrap();
-        let (log_data_producer, log_data_consumer) = ctx.local.dataQueue.split();
         (
             Shared {
                 usb_dev,
@@ -224,6 +231,7 @@ mod app {
                 last_sensor_irq_us: 0,
                 fifo_tx,
                 fifo_rx,
+                sensor_q_tx,
                 power: 0,
             },
             Local {
@@ -232,8 +240,8 @@ mod app {
                 encoder_last_time: TimerInstantU64::<1_000_000>::from_ticks(0),
                 _pwm_a_pin: pwm_a_pin,
                 _pwm_b_pin: pwm_b_pin,
-                log_data_producer,
-                log_data_consumer,
+                log_data_consumer: log_q_rx,
+                control_q_rx,
                 us0,
                 us1,
                 us2,
@@ -269,7 +277,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0, encoder, encoder_last_time, us0_irq, us1_irq, us2_irq], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0, encoder, encoder_last_time, us0_irq, us1_irq, us2_irq], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -303,7 +311,14 @@ mod app {
                     0.0,
                     time_diff.ticks() as f32,
                 );
-                ctx.shared.fifo_tx.lock(|tx| tx.send_sensor_event(&event));
+                ctx.shared.sensor_q_tx.lock(|q| {
+                    if q.enqueue(event).is_err() {
+                        defmt::warn!("sensor_q full, encoder event dropped");
+                    }
+                });
+                ctx.shared
+                    .fifo_tx
+                    .lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
             }
 
             ctx.local
@@ -317,7 +332,7 @@ mod app {
         ctx.local.us2_irq.on_interrupt();
     }
 
-    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx], priority = 2)]
+    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 2)]
     async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
         loop {
             MainMono::delay(100u64.millis()).await;
@@ -329,7 +344,14 @@ mod app {
                 let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
                 ctx.shared.measured_speed_mps.lock(|speed| *speed = 0.0);
                 let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
-                ctx.shared.fifo_tx.lock(|tx| tx.send_sensor_event(&event));
+                ctx.shared.sensor_q_tx.lock(|q| {
+                    if q.enqueue(event).is_err() {
+                        defmt::warn!("sensor_q full, timeout event dropped");
+                    }
+                });
+                ctx.shared
+                    .fifo_tx
+                    .lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
             }
         }
     }
@@ -363,59 +385,37 @@ mod app {
         }
     }
 
-    /// Receives control events from Core 1 and applies PWM outputs.
-    #[task(binds = SIO_IRQ_FIFO, local = [log_data_producer],shared = [pwm, fifo_rx, power,measured_speed_mps,speed_setpoint_mps], priority = 4)]
+    /// Receives control signals from Core 1 and applies PWM outputs.
+    #[task(binds = SIO_IRQ_FIFO, local = [control_q_rx], shared = [pwm, fifo_rx, power], priority = 4)]
     fn sio_interrupt(ctx: sio_interrupt::Context) {
         let mut pwm = ctx.shared.pwm;
         let mut fifo_rx = ctx.shared.fifo_rx;
         let mut power = ctx.shared.power;
-        let mut measured_speed_mps = ctx.shared.measured_speed_mps;
-        let mut speed_setpoint_mps = ctx.shared.speed_setpoint_mps;
 
-        let mut log_data = LogData {
-            timestamp: MainMono::now(),
-            steer_value_ms: 0,
-            throttle_value_ms: 0,
-            setpoint_value: speed_setpoint_mps.lock(|s| *s),
-            error_value: 0.0,
-            speed_value: measured_speed_mps.lock(|s| *s),
-            kalman_values: [0.0; 4],
-        };
-        while fifo_rx.lock(|rx| rx.have_data()) {
-            match fifo_rx.lock(ipc::ControlEvent::from_fifo_rx_blocking) {
-                ipc::ControlEvent::Control {
-                    steer_pwm_us,
-                    power_pwm_us,
-                } => {
-                    let steer_on =
-                        MicrosDurationU32::from_ticks(steer_pwm_us as u32).min(PWM_PERIOD);
-                    let power_on =
-                        MicrosDurationU32::from_ticks(power_pwm_us as u32).min(PWM_PERIOD);
-                    log_data.steer_value_ms = steer_on.ticks() as u16;
-                    log_data.throttle_value_ms = power_on.ticks() as u16;
-                    pwm.lock(|pwm| {
-                        let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
-                        let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
-                    });
-                    power.lock(|p| *p = power_pwm_us);
-                    trace!("ctrl: steer={} us  power={} us", steer_pwm_us, power_pwm_us);
+        while let Some(word) = fifo_rx.lock(|rx| rx.try_read()) {
+            match ipc::IpcSignal::from_u32(word) {
+                Some(ipc::IpcSignal::ControlReady) => {
+                    if let Some(output) = ctx.local.control_q_rx.dequeue() {
+                        let steer_on = MicrosDurationU32::from_ticks(output.steer_pwm_us as u32)
+                            .min(PWM_PERIOD);
+                        let power_on = MicrosDurationU32::from_ticks(output.power_pwm_us as u32)
+                            .min(PWM_PERIOD);
+                        pwm.lock(|pwm| {
+                            let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
+                            let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+                        });
+                        power.lock(|p| *p = output.power_pwm_us);
+                        trace!(
+                            "ctrl: steer={} us  power={} us",
+                            output.steer_pwm_us, output.power_pwm_us
+                        );
+                    }
                 }
-                ipc::ControlEvent::Pid {
-                    error,
-                    proportional: _,
-                    integral: _,
-                    derivative: _,
-                } => {
-                    log_data.error_value = error;
+                Some(ipc::IpcSignal::LogReady) => {
+                    log_data::spawn().ok();
                 }
-                ipc::ControlEvent::KalmanDebug { x } => {
-                    log_data.kalman_values = x;
-                }
+                _ => {}
             }
-        }
-        ctx.local.log_data_producer.enqueue(log_data).ok(); // Ignore enqueue failures if the log queue is full.
-        if ctx.local.log_data_producer.capacity() == 0 {
-            log_data::spawn().ok(); // Trigger log processing if we have data to send but the consumer might be idle.
         }
     }
 
@@ -449,21 +449,21 @@ mod app {
                 Ok(ticks) => info!("us0: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us0: timeout"),
             }
-            next = next + INTER_SENSOR_DELAY_US.micros();
+            next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
             match ctx.local.us1.measure::<MainMono>(TIMEOUT_US.micros()).await {
                 Ok(ticks) => info!("us1: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us1: timeout"),
             }
-            next = next + INTER_SENSOR_DELAY_US.micros();
+            next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
             match ctx.local.us2.measure::<MainMono>(TIMEOUT_US.micros()).await {
                 Ok(ticks) => info!("us2: {} us (~{} cm)", ticks, ticks as u32 / 58),
                 Err(_) => warn!("us2: timeout"),
             }
-            next = next + INTER_SENSOR_DELAY_US.micros();
+            next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
         }
     }

@@ -33,9 +33,9 @@ use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use embedded_hal::digital::OutputPin;
-use rp235x_hal as hal;
 use hal::gpio::{self, AnyPin, FunctionPwm, PinId, PullType};
 use hal::pwm::{self, FreeRunning, InputHighRunning, SliceId, ValidPwmInputPin};
+use rp235x_hal as hal;
 use rtic_monotonics::Monotonic;
 
 /// Trigger pulse duration in CPU cycles.
@@ -141,6 +141,12 @@ impl HcSr04Shared {
                 shared: self,
             },
         )
+    }
+}
+
+impl Default for HcSr04Shared {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

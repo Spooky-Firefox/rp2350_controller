@@ -20,10 +20,15 @@ libm = "0.2"
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 heapless = "0.8"
+atomic-waker = "1.1"
+
+[dev-dependencies]
+panic-halt = "0.2"
 
 [features]
 default = ["echo_usb"]
 echo_usb = []
+simple_csv = []
 
 [profile.dev]
 codegen-units = 1

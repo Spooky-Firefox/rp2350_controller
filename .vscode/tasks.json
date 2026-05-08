@@ -1,0 +1,68 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--target",
+        "thumbv8m.main-none-eabihf"
+      ],
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "build-release",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--release",
+        "--target",
+        "thumbv8m.main-none-eabihf"
+      ],
+      "problemMatcher": [
+        "$rustc"
+      ]
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "clean"
+      ]
+    },
+    {
+      "label": "run",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--target",
+        "thumbv8m.main-none-eabihf"
+      ],
+      "problemMatcher": [
+        "$rustc"
+      ]
+    },
+    {
+      "label": "stop openocd",
+      "type": "shell",
+      "command": "pkill",
+      "args": [
+        "-f",
+        "openocd"
+      ],
+      "isBackground": false,
+      "problemMatcher": []
+    }
+  ]
+}

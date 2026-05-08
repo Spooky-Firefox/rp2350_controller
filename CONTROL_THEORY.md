@@ -209,7 +209,7 @@ Steering is handled by a separate `SteeringDistanceController` that runs indepen
 
 ### Activation
 
-The controller is only active when the center sensor reads below `min_distance_cm` (default 30 cm). If the center is clear, the steering output is `neutral_steering_pwm_us` (1500 µs).
+The controller is only active when the center sensor reads **above** `min_distance_cm` (default 30 cm), meaning the path ahead is clear. If something is close in front, the output is `neutral_steering_pwm_us` (1500 µs) and the wall-following PID is suspended — this avoids fighting an obstacle with steering corrections.
 
 ### Error definition
 

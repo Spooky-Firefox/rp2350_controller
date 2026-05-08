@@ -76,7 +76,9 @@ pub struct SteeringDistanceController {
     pub previous_error: f32,
     pub integral_limit: f32,
     pub neutral_steering_pwm_us: u16,
-    /// Activate steering only when center sensor reads below this threshold [cm].
+    /// Activate steering only when center sensor reads **above** this threshold [cm]
+    /// (i.e. the path ahead is clear).  When something is close in front, the
+    /// controller returns neutral to avoid fighting an obstacle.
     pub min_distance_cm: f32,
     /// Last computed PID terms — populated by `update`, read for telemetry.
     pub last_error: f32,
@@ -98,7 +100,9 @@ impl SteeringDistanceController {
     ) -> u16 {
         let center_valid = dist_center_cm.is_finite() && dist_center_cm > 0.0;
 
-        if !center_valid || dist_center_cm > self.min_distance_cm {
+        // Active only when the path ahead is clear (center >= min_distance_cm).
+        // If something is close in front, return neutral to avoid fighting the obstacle.
+        if !center_valid || dist_center_cm < self.min_distance_cm {
             self.last_error = 0.0;
             self.last_proportional = 0.0;
             self.last_integral = 0.0;

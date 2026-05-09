@@ -10,7 +10,7 @@ use fugit::TimerInstantU64;
 use rp235x_hal as hal;
 
 /// Arc length per encoder magnet pulse [m].
-const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
+const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 600.0;
 
 /// Entry point for Core 1.  Called from the RTIC `init` on Core 0 via
 /// `core.spawn(...)`.  Runs a blocking event loop that never returns.

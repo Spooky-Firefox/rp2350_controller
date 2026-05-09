@@ -40,7 +40,7 @@ const PWM_DIV_INT: u8 = 64;
 const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / PWM_DIV_INT as u32;
 
 /// Arc length per encoder pulse [m].
-const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 13.0 * PI / 300.0;
+const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 13.0 * PI / 600.0;
 
 // Standard RC-servo frame period (50 Hz).
 const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);

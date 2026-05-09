@@ -20,7 +20,9 @@ function sim_data = generate_kalman_data(output_file)
     PLANT.W   = 0.200;    % track width [m]
     PLANT.wheel_circumference = 2 * pi * PLANT.r_w;  % full wheel circumference [m]
     PLANT.pulses_per_rotation = 3;                    % encoder pulses per full rotation
-    PLANT.pulse_distance = PLANT.wheel_circumference / PLANT.pulses_per_rotation; % [m/pulse]
+    PLANT.encoder_trigger_distance_scale = 0.5;       % encoder triggers twice per expected arc step
+    PLANT.pulse_distance = (PLANT.wheel_circumference / PLANT.pulses_per_rotation) ...
+        * PLANT.encoder_trigger_distance_scale;        % [m/pulse]
 
     % Steering actuator (2nd-order) and PWM mapping configuration.
     PLANT.steer.max_angle_deg = 28;          % +/- max steering angle [deg]
@@ -31,7 +33,8 @@ function sim_data = generate_kalman_data(output_file)
     PLANT.throttle.deadband_us = 25;         % +/- deadband around 1500 us
     PLANT.throttle.max_accel_fwd = 2.2;      % [m/s^2]
     PLANT.throttle.max_accel_rev = 1.8;      % [m/s^2]
-    PLANT.throttle.drag_coeff = 0.35;        % simple linear drag [1/s]
+    PLANT.throttle.drag_k0 = 3.669;          % rolling resistance [m/s^2] — measured
+    PLANT.throttle.drag_k1 = 0.201;          % viscous drag [1/s]         — measured
 
     % Timing uncertainty per wheel pulse.
     % On real hardware this is your timer resolution + interrupt latency.

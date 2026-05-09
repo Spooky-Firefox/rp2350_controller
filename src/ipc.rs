@@ -1,30 +1,67 @@
 //! Inter-core communication types and SIO FIFO primitives.
-#![deny(unsafe_code)]
+#![allow(unsafe_code)] // FifoTx/FifoRx use direct PAC register access; see safety comments.
 //!
-//! # SensorEvent (Core 0 → Core 1): 6 × 32-bit FIFO words
+//! # Protocol
 //!
-//! | Word | Content |
-//! |------|---------|
-//! | 0    | `timestamp_us` (lower 32 bits from `MainMono::now()`) |
-//! | 1    | `setpoint_mps` as `f32::to_bits()` |
-//! | 2    | `values[0]` as `f32::to_bits()` |
-//! | 3    | `values[1]` as `f32::to_bits()` |
-//! | 4    | `values[2]` as `f32::to_bits()` |
-//! | 5    | `values[3]` as `f32::to_bits()` |
+//! Data is exchanged via `heapless::spsc` queues.  The SIO FIFO carries only
+//! 1-word [`IpcSignal`] values that tell the receiving core which queue has
+//! new data.
 //!
-//! Unused value slots are set to `f32::INFINITY`.
-//! The 32-bit timestamp wraps every ~71.6 min; use [`TimeExtender`] on the
-//! receiver to reconstruct a monotonic `u64`.
+//! | Direction       | Signal                    | Payload queue        |
+//! |-----------------|---------------------------|----------------------|
+//! | Core 0 → Core 1 | `IpcSignal::SensorReady`  | `SensorEvent` SPSC   |
+//! | Core 1 → Core 0 | `IpcSignal::ControlReady` | `ControlOutput` SPSC |
 //!
-//! # ControlEvent (Core 1 → Core 0): 1 × 32-bit FIFO word
+//! The 32-bit timestamp in [`SensorEvent`] wraps every ~71.6 min; use
+//! [`TimeExtender`] on the receiver to reconstruct a monotonic `u64`.
 //!
-//! | Word | Content |
-//! |------|---------|
-//! | 0    | `[steer_pwm_us: u16 | power_pwm_us: u16]` |
+//! ## Why `FifoTx` / `FifoRx` are split
+//!
+//! On Core 0, `FifoTx` and `FifoRx` live in separate RTIC shared resources so
+//! they get different priority ceilings:
+//! - `FifoTx` ceiling = 3 (shared with `gpio_interrupt` / `sensor_timeout`)
+//! - `FifoRx` ceiling = 4 (exclusive to `sio_interrupt`)
+//!
+//! This ensures `sio_interrupt` (priority 4) is never ceiling-blocked by a
+//! lower-priority task that holds the TX lock, preventing inter-core FIFO
+//! deadlocks.
 
 use rp235x_hal::sio::SioFifo;
+use rp235x_pac;
 
-/// Sensor event packed as 6 × u32 words for SIO FIFO transfer.
+// ─────────────────────────────────────────────────────────────────────────────
+// IPC signal words
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One-word signal sent over the SIO FIFO to notify the other core that new
+/// data is available in the corresponding SPSC queue.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcSignal {
+    /// Core 0 → Core 1: a [`SensorEvent`] has been pushed to the sensor queue.
+    SensorReady = 1,
+    /// Core 1 → Core 0: a [`ControlOutput`] has been pushed to the control queue.
+    ControlReady = 2,
+    /// Core 1 → Core 0: a [`LogData`] has been pushed to the log queue.
+    LogReady = 3,
+}
+
+impl IpcSignal {
+    pub fn from_u32(w: u32) -> Option<Self> {
+        match w {
+            1 => Some(IpcSignal::SensorReady),
+            2 => Some(IpcSignal::ControlReady),
+            3 => Some(IpcSignal::LogReady),
+            _ => None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sensor event (Core 0 → Core 1 via SPSC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sensor snapshot produced by Core 0 and consumed by Core 1.
 #[derive(Clone, Copy, Debug)]
 pub struct SensorEvent {
     /// 32-bit microsecond timestamp (lower 32 bits of `MainMono::now()`).
@@ -56,126 +93,17 @@ impl SensorEvent {
             values: [steer, f32::INFINITY, f32::INFINITY, f32::INFINITY],
         }
     }
-
-    /// Encode into 6 FIFO words.
-    pub fn to_words(&self) -> [u32; 6] {
-        [
-            self.t32_us,
-            self.setpoint_mps.to_bits(),
-            self.values[0].to_bits(),
-            self.values[1].to_bits(),
-            self.values[2].to_bits(),
-            self.values[3].to_bits(),
-        ]
-    }
-
-    /// Decode from 6 FIFO words.
-    pub fn from_words(words: [u32; 6]) -> Self {
-        Self {
-            t32_us: words[0],
-            setpoint_mps: f32::from_bits(words[1]),
-            values: [
-                f32::from_bits(words[2]),
-                f32::from_bits(words[3]),
-                f32::from_bits(words[4]),
-                f32::from_bits(words[5]),
-            ],
-        }
-    }
 }
 
-/// Control output from Core 1 → Core 0: two PWM on-times packed into one word.
+// ─────────────────────────────────────────────────────────────────────────────
+// Control output (Core 1 → Core 0 via SPSC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Control output produced by Core 1 and consumed by Core 0 to drive the PWM.
 #[derive(Clone, Copy, Debug)]
-pub enum ControlEvent {
-    // control signal
-    Control {
-        steer_pwm_us: u16,
-        power_pwm_us: u16,
-    },
-    Pid {
-        error: f32,
-        proportional: f32,
-        integral: f32,
-        derivative: f32,
-    },
-    KalmanDebug {
-        x: [f32; 4],
-    },
-}
-
-impl ControlEvent {
-    pub fn to_words(&self) -> heapless::Vec<u32, 6> {
-        match self {
-            ControlEvent::Control {
-                steer_pwm_us,
-                power_pwm_us,
-            } => heapless::Vec::from_slice(&[
-                1,
-                (*steer_pwm_us as u32) << 16 | (*power_pwm_us as u32),
-            ])
-            .unwrap(),
-            ControlEvent::Pid {
-                error,
-                proportional,
-                integral,
-                derivative,
-            } => heapless::Vec::from_slice(&[
-                2,
-                error.to_bits(),
-                proportional.to_bits(),
-                integral.to_bits(),
-                derivative.to_bits(),
-            ])
-            .unwrap(),
-            ControlEvent::KalmanDebug { x } => heapless::Vec::from_slice(&[
-                3,
-                x[0].to_bits(),
-                x[1].to_bits(),
-                x[2].to_bits(),
-                x[3].to_bits(),
-            ])
-            .unwrap(),
-        }
-    }
-
-    pub fn from_fifo_chanel_blocking(channel: &mut FifoChannel) -> Self {
-        match channel.fifo.read_blocking() {
-            1 => {
-                let w = channel.fifo.read_blocking();
-                let steer_pwm_us = ((w >> 16) & 0xFF) as u16;
-                let power_pwm_us = (w & 0xFFFF) as u16;
-                return ControlEvent::Control {
-                    steer_pwm_us,
-                    power_pwm_us,
-                };
-            }
-            2 => {
-                let error = f32::from_bits(channel.fifo.read_blocking());
-                let proportional = f32::from_bits(channel.fifo.read_blocking());
-                let integral = f32::from_bits(channel.fifo.read_blocking());
-                let derivative = f32::from_bits(channel.fifo.read_blocking());
-                return ControlEvent::Pid {
-                    error,
-                    proportional,
-                    integral,
-                    derivative,
-                };
-            }
-            3 => {
-                let x0 = f32::from_bits(channel.fifo.read_blocking());
-                let x1 = f32::from_bits(channel.fifo.read_blocking());
-                let x2 = f32::from_bits(channel.fifo.read_blocking());
-                let x3 = f32::from_bits(channel.fifo.read_blocking());
-                return ControlEvent::KalmanDebug {
-                    x: [x0, x1, x2, x3],
-                };
-            }
-            _ => {
-                // Handle unknown event type or error as needed.
-                panic!("Unknown control event type or FIFO read error");
-            }
-        }
-    }
+pub struct ControlOutput {
+    pub steer_pwm_us: u16,
+    pub power_pwm_us: u16,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,70 +144,76 @@ impl TimeExtender {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Core 0 split FIFO halves
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Core 0 write-only FIFO half: Core 0 → Core 1.
+///
+/// Shared only with tasks at priority ≤ 3, giving it an RTIC priority ceiling
+/// of 3.  `sio_interrupt` (priority 4) can always preempt any task that holds
+/// this lock, keeping Core 1's reply path unblocked.
+pub struct FifoTx;
+
+impl FifoTx {
+    fn write_word_blocking(value: u32) {
+        // SAFETY: Only Core 0 writes to fifo_wr; no concurrent writers exist.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        while !sio.fifo_st().read().rdy().bit_is_set() {
+            cortex_m::asm::nop();
+        }
+        sio.fifo_wr().write(|w| unsafe { w.bits(value) });
+        cortex_m::asm::sev();
+    }
+
+    /// Send a single [`IpcSignal`] word to Core 1 (blocking until FIFO has space).
+    pub fn signal(&mut self, sig: IpcSignal) {
+        Self::write_word_blocking(sig as u32);
+    }
+}
+
+/// Core 0 read-only FIFO half: Core 1 → Core 0.
+///
+/// Used exclusively by `sio_interrupt` (priority 4).  Its RTIC priority
+/// ceiling is therefore 4, which allows `sio_interrupt` to preempt any task
+/// holding `FifoTx` (ceiling 3).
+pub struct FifoRx;
+
+impl FifoRx {
+    /// Try to read one word without blocking.  Returns `None` if the FIFO is
+    /// empty.
+    pub fn try_read(&mut self) -> Option<u32> {
+        // SAFETY: Only Core 0 reads from fifo_rd; no concurrent readers.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        if sio.fifo_st().read().vld().bit_is_set() {
+            Some(sio.fifo_rd().read().bits())
+        } else {
+            None
+        }
+    }
+
+    /// Discard all words currently in the RX FIFO.
+    pub fn drain(&mut self) {
+        // SAFETY: Only Core 0 reads from fifo_rd.
+        let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
+        while sio.fifo_st().read().vld().bit_is_set() {
+            let _ = sio.fifo_rd().read().bits();
+        }
+    }
+}
+
+/// Consume the Core 0 [`SioFifo`] and produce separate [`FifoTx`] / [`FifoRx`]
+/// halves that live in independent RTIC shared resources, giving them distinct
+/// priority ceilings.
+pub fn split_fifo(fifo: SioFifo) -> (FifoTx, FifoRx) {
+    // The HAL SioFifo is consumed and dropped; FifoTx/FifoRx access the same
+    // hardware via direct PAC register reads/writes.
+    drop(fifo);
+    (FifoTx, FifoRx)
+}
+
 impl Default for TimeExtender {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Owned SIO FIFO channel (no unsafe, uses rp235x-hal)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Owns the SIO FIFO and provides typed inter-core message passing.
-///
-/// Hardware routes reads/writes based on the executing core, so each core
-/// constructs its own `FifoChannel` from its `SioFifo` handle.
-pub struct FifoChannel {
-    fifo: SioFifo,
-    rx_buf: [u32; 6],
-    rx_count: usize,
-}
-
-impl FifoChannel {
-    pub fn new(fifo: SioFifo) -> Self {
-        Self {
-            fifo,
-            rx_buf: [0u32; 6],
-            rx_count: 0,
-        }
-    }
-    pub fn have_data(&mut self) -> bool {
-        self.fifo.is_read_ready()
-    }
-
-    /// Discard all data currently in the RX FIFO.
-    pub fn drain(&mut self) {
-        self.fifo.drain();
-    }
-
-    /// Send a complete [`SensorEvent`] (6 blocking writes).
-    pub fn send_sensor_event(&mut self, event: &SensorEvent) {
-        for &w in &event.to_words() {
-            self.fifo.write_blocking(w);
-        }
-    }
-
-    /// Send a complete [`ControlEvent`] (1 blocking write).
-    pub fn send_control_event_blocking(&mut self, event: &ControlEvent) {
-        for &w in &event.to_words() {
-            self.fifo.write_blocking(w);
-        }
-    }
-
-    /// Accumulate FIFO words into the internal 6-word buffer.
-    /// Returns `Some` when all 6 words have been collected.
-    pub fn try_recv_sensor_event(&mut self) -> Option<SensorEvent> {
-        while self.rx_count < 6 {
-            match self.fifo.read() {
-                Some(w) => {
-                    self.rx_buf[self.rx_count] = w;
-                    self.rx_count += 1;
-                }
-                None => return None,
-            }
-        }
-        self.rx_count = 0;
-        Some(SensorEvent::from_words(self.rx_buf))
     }
 }

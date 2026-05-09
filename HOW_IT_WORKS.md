@@ -20,11 +20,15 @@ The program uses a framework called **RTIC** (Real-Time Interrupt-driven Concurr
 Each task has a **priority level** — higher priority tasks can interrupt lower priority ones if they need to run urgently.
 
 ```text
-Priority 3 (highest) │  gpio_interrupt   — encoder edge detected
-Priority 2           │  sio_interrupt    — control output from Core 1
-                     │  sensor_timeout   — no encoder pulse for 100 ms
-                     │  usb_interrupt    — USB data arrived
+Priority 5 (highest) │  usb_interrupt    — USB data arrived
+Priority 4           │  sio_interrupt    — control output from Core 1
+Priority 3           │  gpio_interrupt   — encoder edge detected
+Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
+                     │  delay_update_setpoint — defer setpoint updates
+                     │  log_data         — send logging data to host
+                     │  periodic_drain_log_data — trigger log buffer drain
+                     │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -35,10 +39,14 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
 | `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, sends `SensorEvent` to Core 1 |
-| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Sends a timeout event to Core 1 so the filter can coast |
-| `sio_interrupt` | Core 1 writes to FIFO | Receives `ControlEvent` and applies PWM outputs |
+| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
+| `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
+| `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
 | `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
+| `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
+| `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
+| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
 
 ---
 
@@ -63,14 +71,53 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
 
 ### Inter-Core Communication (IPC)
 
-The two cores talk through a **32-bit hardware FIFO** built into the RP2350's SIO peripheral. Each core has its own TX and RX side — data written by one core appears on the other's read side.
+The two cores share data through **`heapless::spsc` lock-free queues**. The SIO hardware FIFO carries only lightweight 1-word **signal values** (`IpcSignal`) that tell the receiving core which queue to read from — no bulk data crosses the FIFO.
 
-| Direction | Message | Size | Content |
-| --------- | ------- | ---- | ------- |
-| Core 0 → Core 1 | `SensorEvent` | 6 words | timestamp, speed setpoint, steering, encoder period |
-| Core 1 → Core 0 | `ControlEvent` | 1 word | steering PWM + power PWM packed into 16 bits each |
+```text
+ Core 0                                            Core 1
+ ──────────────────────────────────────────────────────────
+ sensor_q (Producer) ──── SensorEvent ──► sensor_q (Consumer)
+                    SIO FIFO: SensorReady ──►
 
-The `FifoChannel` struct owns the `SioFifo` from the HAL, so all FIFO access is safe — no raw pointer manipulation. See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on what Core 1 does with these events.
+ control_q (Consumer) ◄─ ControlOutput ── control_q (Producer)
+ log_q (Consumer)     ◄─── LogData ─────  log_q (Producer)
+                    ◄── SIO FIFO: ControlReady / LogReady
+```
+
+#### Signal variants (`IpcSignal`, `#[repr(u32)]`)
+
+| Value | Name | Direction | Meaning |
+| ----- | ---- | --------- | ------- |
+| `1` | `SensorReady` | Core 0 → Core 1 | A `SensorEvent` was pushed to `sensor_q` |
+| `2` | `ControlReady` | Core 1 → Core 0 | A `ControlOutput` was pushed to `control_q` |
+| `3` | `LogReady` | Core 1 → Core 0 | A `LogData` was pushed to `log_q` |
+
+#### Queues
+
+| Queue | Type | Depth | Producer | Consumer |
+| ----- | ---- | ----- | -------- | -------- |
+| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`) | Core 1 |
+| `control_q` | `ControlOutput` | 4 | Core 1 | Core 0 (`sio_interrupt`) |
+| `log_q` | `LogData` | 128 | Core 1 | Core 0 (`log_data`) |
+
+#### Why SPSC queues instead of raw FIFO?
+
+The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlEvent` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
+
+#### Why is `FifoTx` / `FifoRx` split?
+
+On Core 0, the two FIFO halves live in **separate RTIC shared resources** so they get different priority ceilings:
+
+- `fifo_tx` — ceiling 3 (shared with `gpio_interrupt` and `sensor_timeout`)
+- `fifo_rx` — ceiling 4 (exclusive to `sio_interrupt`)
+
+This ensures `sio_interrupt` (priority 4) is never priority-ceiling-blocked by a lower-priority task that holds the TX lock, which would stall Core 1.
+
+#### Queue lifetimes — no `static mut` needed
+
+The queues are declared as `init` locals in the RTIC `init` function. RTIC places those locals in static storage, so `.split()` yields `'static` producers/consumers that can be moved directly into the `core1.spawn(...)` closure — no `unsafe` global state required.
+
+See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on what Core 1 does with sensor events.
 
 ---
 
@@ -92,6 +139,136 @@ The `FifoChannel` struct owns the `SioFifo` from the HAL, so all FIFO access is 
 - Range is typically 1000–2000 µs
 
 There are two independent channels: **PWM-A** (GPIO 16) and **PWM-B** (GPIO 17).
+
+---
+
+## HC-SR04 — Ultrasonic Distance Sensor
+
+The HC-SR04 measures distance using ultrasound.  It has two signal pins:
+
+| Pin | Direction | Description |
+| --- | --------- | ----------- |
+| TRIG | MCU → sensor | Hold high for ≥ 10 µs to fire one measurement |
+| ECHO | sensor → MCU | Goes high when the burst is sent; falls when the reflection arrives |
+
+Distance in centimetres ≈ echo pulse width in µs ÷ 58.
+
+### Wiring
+
+| Sensor | TRIG pin | ECHO pin | PWM slice | Notes |
+| ------ | -------- | -------- | --------- | ----- |
+| 0 | GPIO 14 | GPIO 15 | Pwm7 B | |
+| 1 | GPIO 12 | GPIO 13 | Pwm6 B | |
+| 2 | GPIO 10 | GPIO 11 | Pwm5 B | |
+
+The TRIG pins are plain digital outputs (SioOutput).  The ECHO pins are connected to the B channel of their respective PWM slices — the B channel is the hardware gate input in `InputHighRunning` mode.
+
+### How the counter works
+
+Instead of using a software timer to measure the echo pulse width, the driver connects the ECHO pin to the **B channel** of a dedicated PWM slice configured in **`InputHighRunning`** mode.  In this mode the hardware counter increments on every system-clock edge **only while pin B is high**.  When the echo falls, the counter value equals the pulse width in clock cycles — no interrupt latency error, no polling.
+
+```text
+             trigger
+MCU TRIG: ──┐     ┌────────────────── (next measurement)
+            └─────┘  ← 20 µs busy-wait
+
+ECHO pin: ─────────────┐              ┌────────────────────
+                       └──────────────┘  ← echo pulse
+
+PWM ctr:  0 0 0 0 0 0 0 1 2 3 4 5 … N N N N N N N N N N 0
+                         ↑ counting              ↑ read & reset
+```
+
+### 🚀 A Word on Over-Engineering
+
+**This PWM approach is completely ridiculous.**
+
+Why? The HC-SR04's own hardware measurement error is ±3 mm — roughly **30 µs of echo pulse width variance** depending on temperature, humidity, and reflectivity of the object. Yet we've dedicated **three PWM slices** to measure with **1 µs resolution** and zero software jitter.
+
+A far simpler approach would be:
+```rust
+let t_start = MainMono::now();
+// (echo fires interrupt)
+let t_end = MainMono::now();
+let pulse_us = (t_end - t_start).to_micros();
+```
+
+This would measure the same thing with **~1 µs ISR-entry jitter** — totally invisible given the sensor's ±3 mm error budget. The "complex" version adds nothing but code complexity and burns hardware resources.
+
+**Why did we do it this way?** Mostly to demonstrate:
+
+- RTIC patterns (split ownership, atomic waker, priority ceiling management)
+- Advanced PWM features (`InputHighRunning` counting mode)  
+- How to avoid shared resource locks with lock-free atomics
+
+In a real product, you'd use the simple `MainMono` approach. Here, consider this a **pedagogical over-engineered masterpiece** — proof that just because you *can* measure something to ±1 µs doesn't mean you *should*.
+
+**But wait — it gets better.** At the default 150 MHz system clock, each counter tick represents one clock period:
+
+$$\frac{c}{150\,\text{MHz}} = \frac{3 \times 10^8\,\text{m/s}}{150 \times 10^6\,\text{Hz}} \approx 1.9986\,\text{m}$$
+
+That's right: **this counter has a time resolution that corresponds to ~2 metres of light travel distance per tick.** If you somehow connected it to a photon detector, the HC-SR04 PWM measuring infrastructure would be accurate enough to... resolve distances to the nearest two metres. Using light. A sensor that costs €0.40 and has a ±3 mm acoustic error budget.
+
+Overclock the RP2350 to 400 MHz (which it handles) and the resolution improves to ~0.75 m per tick — still completely useless for light, but an impressive spec sheet entry. In practice, parasitic capacitance in PCB traces and pin drivers would make any real photon-timing application impossible, but that is entirely beside the point.
+
+**THE OVER-ENGINEERED SOLUTION IS A MASTERPIECE.**
+
+### `ultrasound_scan` task
+
+The `ultrasound_scan` async task (priority 1) polls all three sensors in a round-robin loop with 60 ms between each measurement start:
+
+```text
+t = 0 ms   measure sensor 0  →  delay_until t+60 ms
+t = 60 ms  measure sensor 1  →  delay_until t+120 ms
+t = 120 ms measure sensor 2  →  delay_until t+180 ms
+t = 180 ms measure sensor 0  (next cycle)
+```
+
+`delay_until` is used instead of `delay` so the spacing is referenced to an absolute clock — if a measurement takes varying time (e.g. an echo arrives late), the inter-sensor gap stays deterministic.
+
+Each measurement result is logged via RTT (`defmt::info!`) showing both the raw µs value and an approximate centimetre figure.  Timeout (> 50 ms, no echo) is logged as a warning.
+
+### Ownership split
+
+The driver is split into two objects with the same lifetime so neither needs to be an RTIC shared resource (which would raise the priority ceiling):
+
+| Type | Stored in | Role |
+| ---- | --------- | ---- |
+| `HcSr04Shared` | `init` local (static) | Holds the `AtomicWaker` and done flag |
+| `HcSr04Measure` | Measuring async task local | Drives trigger, resets counter, awaits result |
+| `HcSr04OnInterrupt` | `gpio_interrupt` task local | Called from ISR; clears interrupt and wakes the future |
+
+```text
+  init locals
+  ┌──────────────────────────────────┐
+  │ HcSr04Shared { waker, done }     │
+  │   &'static ──────────────────┐   │
+  │   &'static ──────────┐       │   │
+  └──────────────────────│───────│───┘
+                         │       │
+               HcSr04OnInterrupt │     ← gpio_interrupt task
+                  .on_interrupt()│
+                    sets done    │
+                    waker.wake() │
+                                 │
+                        HcSr04Measure  ← async measuring task
+                           .measure().await
+                             poll_fn registers waker
+                             reads counter on wake
+```
+
+### Interrupt flow
+
+1. `HcSr04Measure::measure()` resets `done = false`, sends trigger pulse, resets counter.
+2. The future returned by `measure()` registers the task's `Waker` via `AtomicWaker::register()`.
+3. When the echo falls, `IO_IRQ_BANK0` fires → `gpio_interrupt` task → `on_interrupt()` is called.
+4. `on_interrupt()` checks `echo_pin.interrupt_status(EdgeLow)`, clears it, sets `done = true`, calls `AtomicWaker::wake_by_ref()`.
+5. The RTIC executor re-polls `measure()`.  `done` is now `true` → `Poll::Ready` → counter value is returned.
+6. If no echo arrives within the caller-supplied timeout, `rtic_time::Monotonic::timeout_after` returns `HcSr04Error::Timeout`.
+
+### Why no RTIC shared resource?
+
+The waker handoff uses an [`atomic_waker::AtomicWaker`](https://docs.rs/atomic-waker) and an `AtomicBool`, both of which are lock-free.  The interrupt handler (`gpio_interrupt`, priority 3) writes to these atomics with `Release` ordering; the async task reads with `Acquire` ordering.  This is sufficient for correct synchronisation on Cortex-M33 without raising any RTIC priority ceiling.
 
 ---
 
@@ -147,6 +324,70 @@ ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
 
 For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a raw register block. Core 0 locks it before sending or receiving FIFO messages; Core 1 owns its own `FifoChannel` instance in its blocking loop.
+
+---
+
+## Real-Time Logging — Serial Plotter Integration
+
+The program continuously collects telemetry data and streams it to the host PC in **VS Code Serial Plotter format**. This allows real-time visualization of system state without special software.
+
+### Logging Pipeline
+
+```text
+Core 1 (control loop)           Core 0 (I/O)
+    │                               │
+    └─→ [log_data_producer] ───────→ Channel
+                                    │
+                                ┌───┴───┐
+                                │       ├─→ [log_data_consumer ring buffer]
+                                │       │
+                                └───┬───┘
+                                    │
+                 [periodic_drain_log_data] (every 50 ms)
+                                    │
+                                [log_data task]
+                                    │
+                              [USB Serial]
+                                    │
+                              [PC / VS Code]
+```
+
+### Format
+
+Each log line is sent in **VS Code Serial Plotter format**, prefixed with `>` and containing comma-separated `name:value` pairs:
+
+```
+>time_us:12345678, steer_ms:1500, throttle_ms:1500, speed_mps:0.5234, setpoint_mps:0.5000, error:0.0234, kalman0:0.5200, kalman1:0.0012, kalman2:0.0001, kalman3:-0.0003
+```
+
+This data is automatically plotted by VS Code's Serial Plotter extension when it detects a running terminal on the serial port.
+
+### Key Implementation Details
+
+- **Core 1 produces data:** The control loop writes telemetry snapshots to a ring buffer via `log_data_producer`
+- **Core 0 consumes data:** The `log_data` task drains the buffer and formats it for USB transmission
+- **Throttled transmission:** Data is sent every 50 ms (20 Hz) by `periodic_drain_log_data`, preventing USB from being overwhelmed
+- **Async tasks:** Both `log_data` and `periodic_drain_log_data` are async tasks to avoid blocking higher-priority interrupts
+
+---
+
+## Code Organization
+
+The firmware is organized into several Rust modules:
+
+| Module | Purpose |
+| ------ | ------- |
+| `main.rs` | RTIC task definitions, hardware initialization, interrupt handlers |
+| `lib.rs` | Top-level definitions and module exports |
+| `constants.rs` | Global configuration constants (clock speeds, PWM settings, encoder calibration) |
+| `hc_sr04.rs` | HC-SR04 ultrasonic distance sensor driver (split ownership, async measurement) |
+| `logging.rs` | Telemetry logging and VS Code Serial Plotter formatting |
+| `utils.rs` | Utility functions (PWM tick conversion, time conversions) |
+| `ipc.rs` | Inter-process communication structures (`SensorEvent`, `ControlEvent`, `FifoChannel`) |
+| `usb_serial.rs` | USB device initialization and serial port handling |
+| `controller_processor/` | Core 1 control loop (Kalman filter, PID controller) |
+| `controller_processor/kalman_filter.rs` | Extended Kalman Filter implementation |
+| `controller_processor/controller.rs` | PID speed controller logic |
 
 ---
 

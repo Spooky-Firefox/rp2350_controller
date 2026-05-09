@@ -11,6 +11,7 @@
 //! |-----------------|---------------------------|----------------------|
 //! | Core 0 → Core 1 | `IpcSignal::SensorReady`  | `SensorEvent` SPSC   |
 //! | Core 1 → Core 0 | `IpcSignal::ControlReady` | `ControlOutput` SPSC |
+//! | Core 1 → Core 0 | `IpcSignal::LogReady`     | Core 1 log SPSC      |
 //!
 //! The 32-bit timestamp in [`SensorEvent`] wraps every ~71.6 min; use
 //! [`TimeExtender`] on the receiver to reconstruct a monotonic `u64`.
@@ -42,7 +43,7 @@ pub enum IpcSignal {
     SensorReady = 1,
     /// Core 1 → Core 0: a [`ControlOutput`] has been pushed to the control queue.
     ControlReady = 2,
-    /// Core 1 → Core 0: a [`LogData`] has been pushed to the log queue.
+    /// Core 1 → Core 0: a log item has been pushed to the Core 1 log queue.
     LogReady = 3,
 }
 
@@ -61,71 +62,36 @@ impl IpcSignal {
 // Sensor event (Core 0 → Core 1 via SPSC)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The payload of a [`SensorEvent`].
-#[derive(Clone, Copy, Debug)]
-pub enum SensorKind {
-    /// Encoder pulse: current steering angle and the period between two rising
-    /// edges [µs].
-    Encoder { steer: f32, rpm_period_us: f32 },
-    /// Encoder timeout: no pulse received for 100 ms — vehicle is assumed stopped.
-    EncoderTimeout { steer: f32 },
-    /// HC-SR04 distance readings from left, center, and right sensors [cm].
-    /// Invalid / timed-out readings are represented as `f32::INFINITY`.
-    Distances {
-        left_cm: f32,
-        center_cm: f32,
-        right_cm: f32,
-    },
-    /// Speed setpoint change [m/s].  Only sent when the setpoint actually changes.
-    SetpointUpdate { setpoint_mps: f32 },
-}
-
 /// Sensor snapshot produced by Core 0 and consumed by Core 1.
 #[derive(Clone, Copy, Debug)]
 pub struct SensorEvent {
     /// 32-bit microsecond timestamp (lower 32 bits of `MainMono::now()`).
     pub t32_us: u32,
-    /// The sensor reading payload.
-    pub kind: SensorKind,
+    /// Speed setpoint [m/s] for the straight-line speed controller.
+    pub setpoint_mps: f32,
+    /// Up to 4 sensor values.  Unused slots are `f32::INFINITY`.
+    pub values: [f32; 4],
 }
 
 impl SensorEvent {
-    /// Encoder pulse event.
-    pub fn encoder(timestamp_us: u64, steer: f32, rpm_period_us: f32) -> Self {
+    pub fn rpm_and_steer(
+        timestamp_us: u64,
+        setpoint_mps: f32,
+        steer: f32,
+        rpm_period_us: f32,
+    ) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            kind: SensorKind::Encoder {
-                steer,
-                rpm_period_us,
-            },
+            setpoint_mps,
+            values: [steer, rpm_period_us, f32::INFINITY, f32::INFINITY],
         }
     }
 
-    /// Encoder timeout event (vehicle stopped).
-    pub fn encoder_timeout(timestamp_us: u64, steer: f32) -> Self {
+    pub fn steer_only_timeout(timestamp_us: u64, setpoint_mps: f32, steer: f32) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            kind: SensorKind::EncoderTimeout { steer },
-        }
-    }
-
-    /// HC-SR04 distance event.  Use `f32::INFINITY` for a sensor that timed out.
-    pub fn distances(timestamp_us: u64, left_cm: f32, center_cm: f32, right_cm: f32) -> Self {
-        Self {
-            t32_us: timestamp_us as u32,
-            kind: SensorKind::Distances {
-                left_cm,
-                center_cm,
-                right_cm,
-            },
-        }
-    }
-
-    /// Setpoint update — send only when the setpoint value changes.
-    pub fn setpoint_update(timestamp_us: u64, setpoint_mps: f32) -> Self {
-        Self {
-            t32_us: timestamp_us as u32,
-            kind: SensorKind::SetpointUpdate { setpoint_mps },
+            setpoint_mps,
+            values: [steer, f32::INFINITY, f32::INFINITY, f32::INFINITY],
         }
     }
 }

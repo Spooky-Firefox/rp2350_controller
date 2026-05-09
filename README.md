@@ -58,6 +58,10 @@ cargo run --release
 
 By default, debug output goes to the RTT (Real-Time Transfer) probe connected via the SWD debug interface. You can view RTT logs with a tool like `probe-rs` or `JLinkExe`.
 
+The firmware also streams telemetry over USB CDC serial. Control telemetry from Core 1 and ultrasound telemetry from Core 0 are formatted as timestamped event records. In normal mode the stream is sparse `>name:value` output, so fields that do not apply to a given event are omitted. With the `simple_csv` feature enabled, the stream uses a fixed column order and writes `null` for missing fields.
+
+USB commands currently include `pwm-a <microseconds>`, `pwm-b <microseconds>`, `speed <m/s>`, `mode manual`, and `mode auto`. The default is `mode manual`, which keeps direct PWM commands active but prevents Core 0 from applying control outputs received from Core 1 until auto mode is selected.
+
 ### Logging Levels
 
 Control the verbosity of embedded logs via the `DEFMT_LOG` environment variable:
@@ -84,4 +88,4 @@ Filters to only critical issues and status warnings. Less spammy for production-
 - `DEFMT_LOG=info`: high-level runtime events (default)
 - `DEFMT_LOG=error`: errors only
 
-The logging is done via the `defmt` crate and RTT, not USB serial, so it does not interfere with the USB command interface.
+The `defmt` logs still go over RTT, but the structured telemetry stream is sent over USB serial.

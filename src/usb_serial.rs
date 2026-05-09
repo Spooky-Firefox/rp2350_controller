@@ -17,6 +17,12 @@ use usb_device::{
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 pub type MyUsbBus = UsbBus;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlMode {
+    Manual,
+    Auto,
+}
+
 pub fn init_usb_serial(
     usb: pac::USB,
     usb_dpram: pac::USB_DPRAM,
@@ -51,10 +57,14 @@ pub fn process_usb_command(
     command_buffer: &mut [u8; 64],
     buffer_len: &mut usize,
     mut speed_setpoint: impl Mutex<T = f32>,
+    mut control_mode: impl Mutex<T = ControlMode>,
 ) {
     let mut bytes_read = 0;
     (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-        trace!("USB interrupt - polling device. State: {:?}", defmt::Debug2Format(&usb_dev.state()));
+        trace!(
+            "USB interrupt - polling device. State: {:?}",
+            defmt::Debug2Format(&usb_dev.state())
+        );
         if !usb_dev.poll(&mut [serial]) {
             trace!("No USB events to process");
             return;
@@ -156,6 +166,19 @@ pub fn process_usb_command(
             } else {
                 info!("Invalid pwm-b value: {}", rest);
             }
+        } else if let Some(rest) = command.strip_prefix("mode ") {
+            if let Some(new_mode) = parse_control_mode(rest) {
+                control_mode.lock(|mode| *mode = new_mode);
+                info!("Set control mode to {:?}", defmt::Debug2Format(&new_mode));
+
+                #[cfg(feature = "echo_usb")]
+                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
+                    let _ = serial.write(b"\r\nOK\r\n");
+                    usb_dev.poll(&mut [serial]);
+                });
+            } else {
+                info!("Invalid control mode: {}", rest);
+            }
         } else {
             info!("Unknown command: {}", command);
             #[cfg(feature = "echo_usb")]
@@ -174,4 +197,12 @@ fn parse_on_time_us(arg: &str) -> Option<u32> {
 
 fn parse_speed_setpoint(arg: &str) -> Option<f32> {
     arg.trim().parse::<f32>().ok()
+}
+
+fn parse_control_mode(arg: &str) -> Option<ControlMode> {
+    match arg.trim() {
+        "manual" => Some(ControlMode::Manual),
+        "auto" => Some(ControlMode::Auto),
+        _ => None,
+    }
 }

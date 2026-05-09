@@ -4,13 +4,12 @@
 
 This program runs on an **RP2350 microcontroller** (the chip on a Raspberry Pi Pico 2 board). Unlike a regular computer, a microcontroller has no operating system — our program *is* the only thing running. It starts at power-on and runs forever.
 
-The program does five things:
+The program does four things:
 
 1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
-2. **Measures rotation speed** from a Hall-effect encoder (GPIO 18)
-3. **Runs a Kalman-filtered speed controller + wall-following steering** on a dedicated second CPU core
-4. **Polls three HC-SR04 ultrasonic sensors** for wall distance and sends readings to Core 1
-5. **Receives commands** from a PC over USB serial
+2. **Measures rotation speed** from a Hall-effect encoder (GPIO 13)
+3. **Runs a Kalman-filtered speed controller** on a dedicated second CPU core
+4. **Receives commands** from a PC over USB serial
 
 ---
 
@@ -26,10 +25,10 @@ Priority 4           │  sio_interrupt    — control output from Core 1
 Priority 3           │  gpio_interrupt   — encoder edge detected
 Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
-                     │  delay_update_setpoint — periodically toggles setpoint, sends SetpointUpdate
+                     │  delay_update_setpoint — defer setpoint updates
                      │  log_data         — send logging data to host
                      │  periodic_drain_log_data — trigger log buffer drain
-                     │  ultrasound_scan  — poll 3 HC-SR04 sensors, send Distances event to Core 1
+                     │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -39,15 +38,15 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | ------ | ------- | ------------ |
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
-| `toggle_led` | Every 250 ms | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent::Encoder` to `sensor_q`, signals Core 1 |
-| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes `SensorEvent::EncoderTimeout` so the filter can coast |
-| `delay_update_setpoint` | Every 10 s | Toggles speed setpoint 0↔10 m/s, sends `SensorEvent::SetpointUpdate` to Core 1 |
+| `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
+| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
+| `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
 | `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
-| `usb_interrupt` | USB data received | Reads commands, adjusts speed setpoint or PWM; sends `SensorEvent::SetpointUpdate` if the setpoint changed |
+| `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
 | `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
-| `periodic_drain_log_data` | Every 100 ms | Signals `log_data` to drain the logging buffer and transmit |
-| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo, collects all 3 distances, sends `SensorEvent::Distances` to Core 1 |
+| `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
+| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
 
 ---
 
@@ -62,9 +61,9 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
  │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
  │  - encoder ISR           │ Events  │  - Kalman filter         │
  │  - USB serial            │         │  - PID speed controller  │
- │  - PWM output            │ <────── │  - Wall-following PID    │
+ │  - PWM output            │ <────── │                          │
  │  - sensor timeout        │ Control │                          │
- │  - ultrasound scan       │ Events  │                          │
+ │                          │ Events  │                          │
  └──────────────────────────┘         └──────────────────────────┘
 ```
 
@@ -93,28 +92,11 @@ The two cores share data through **`heapless::spsc` lock-free queues**. The SIO 
 | `2` | `ControlReady` | Core 1 → Core 0 | A `ControlOutput` was pushed to `control_q` |
 | `3` | `LogReady` | Core 1 → Core 0 | A `LogData` was pushed to `log_q` |
 
-#### `SensorEvent` — an enum, not a struct
-
-Rather than a flat struct with a `values: [f32; 4]` array (where unused slots were `f32::INFINITY` sentinels), `SensorEvent` carries a typed `kind: SensorKind` field:
-
-| Variant | Fields | Sent by |
-| ------- | ------ | ------- |
-| `Encoder` | `steer`, `rpm_period_us` | `gpio_interrupt` on each encoder pulse |
-| `EncoderTimeout` | `steer` | `sensor_timeout` after 100 ms silence |
-| `Distances` | `left_cm`, `center_cm`, `right_cm` | `ultrasound_scan` after each 3-sensor sweep |
-| `SetpointUpdate` | `setpoint_mps` | `delay_update_setpoint` and `usb_interrupt` on change |
-
-This eliminates the sentinel pattern and lets Core 1 use exhaustive `match` instead of `if is_distance_event` checks.
-
-#### Setpoint delivery
-
-The speed setpoint is **only transmitted when it changes**, via `SensorKind::SetpointUpdate`. Previous versions piggybacked the setpoint on every encoder event. Core 1 tracks the current setpoint in a local variable (`current_setpoint_mps`) and only updates it when a `SetpointUpdate` arrives.
-
 #### Queues
 
 | Queue | Type | Depth | Producer | Consumer |
 | ----- | ---- | ----- | -------- | -------- |
-| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`, `ultrasound_scan`, `delay_update_setpoint`, `usb_interrupt`) | Core 1 |
+| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`) | Core 1 |
 | `control_q` | `ControlOutput` | 4 | Core 1 | Core 0 (`sio_interrupt`) |
 | `log_q` | `LogData` | 128 | Core 1 | Core 0 (`log_data`) |
 
@@ -313,10 +295,12 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
 | `speed <m/s>` | `speed 1.2` | Set the speed controller target to 1.2 m/s |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
+| `mode manual` | `mode manual` | Keep direct PWM commands active and ignore Core 1 control outputs |
+| `mode auto` | `mode auto` | Allow Core 0 to apply control outputs received from Core 1 |
 
 Commands must end with a newline (`\n`). PWM values are capped at the 20 000 µs frame period, and the controller itself later clamps output to the usual servo range of roughly 1000-2000 µs.
 
-`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1.
+`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1. The firmware boots in manual mode, so Core 1 control outputs are ignored until `mode auto` is received.
 
 ---
 
@@ -347,21 +331,18 @@ For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a
 
 ## Real-Time Logging — Serial Plotter Integration
 
-The program continuously collects telemetry data and streams it to the host PC in **VS Code Serial Plotter format**. This allows real-time visualization of system state without special software.
+The program continuously collects telemetry data and streams it to the host PC over USB serial. Control telemetry is produced on Core 1, ultrasound telemetry is produced on Core 0, and one drain task on Core 0 forwards both queues to USB.
 
 ### Logging Pipeline
 
 ```text
 Core 1 (control loop)           Core 0 (I/O)
     │                               │
-    └─→ [log_data_producer] ───────→ Channel
+    ├─→ [core1 log queue] ──────────┤
+    │                               │
+    └─→ [ControlOutput queue]       ├─→ [core0 log queue from ultrasound]
                                     │
-                                ┌───┴───┐
-                                │       ├─→ [log_data_consumer ring buffer]
-                                │       │
-                                └───┬───┘
-                                    │
-                 [periodic_drain_log_data] (every 50 ms)
+                      [periodic_drain_log_data + LogReady]
                                     │
                                 [log_data task]
                                     │
@@ -372,19 +353,26 @@ Core 1 (control loop)           Core 0 (I/O)
 
 ### Format
 
-Each log line is sent in **VS Code Serial Plotter format**, prefixed with `>` and containing comma-separated `name:value` pairs:
+In normal mode, each log line is prefixed with `>` and contains only the fields that exist for that event:
 
 ```
->time_us:12345678, steer_ms:1500, throttle_ms:1500, speed_mps:0.5234, setpoint_mps:0.5000, error:0.0234, kalman0:0.5200, kalman1:0.0012, kalman2:0.0001, kalman3:-0.0003
+>time_us:12345678,steer_us:1500,throttle_us:1500,setpoint_mps:0.5000,error:0.0234,delta_t_us:19120,kalman0:0.5200,kalman1:0.0012,kalman2:0.0001,kalman3:-0.0003
+>time_us:12410000,distance0_cm:82,distance2_cm:79
 ```
 
-This data is automatically plotted by VS Code's Serial Plotter extension when it detects a running terminal on the serial port.
+With the `simple_csv` feature enabled, the firmware instead emits a fixed column order:
+
+```
+time_us,event,steer_us,throttle_us,setpoint_mps,error,delta_t_us,kalman0,kalman1,kalman2,kalman3,distance0_cm,distance1_cm,distance2_cm
+```
+
+Fields that do not apply to the current event are written as `null`.
 
 ### Key Implementation Details
 
-- **Core 1 produces data:** The control loop writes telemetry snapshots to a ring buffer via `log_data_producer`
-- **Core 0 consumes data:** The `log_data` task drains the buffer and formats it for USB transmission
-- **Throttled transmission:** Data is sent every 50 ms (20 Hz) by `periodic_drain_log_data`, preventing USB from being overwhelmed
+- **Two SPSC log queues:** one queue per core avoids deprecated MPMC patterns in `heapless`
+- **Core 0 drains both queues:** the `log_data` task formats mixed event types for USB transmission
+- **Throttled transmission:** `periodic_drain_log_data` runs every 100 ms, and Core 1 can also trigger an immediate drain with `LogReady`
 - **Async tasks:** Both `log_data` and `periodic_drain_log_data` are async tasks to avoid blocking higher-priority interrupts
 
 ---

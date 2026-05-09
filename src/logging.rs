@@ -9,14 +9,29 @@ use usb_device::device::UsbDevice;
 use usb_device::device::UsbDeviceState;
 use usbd_serial::SerialPort;
 
+#[derive(Clone, Copy)]
 pub struct LogData {
     pub timestamp: TimerInstantU64<1_000_000>,
-    pub steer_value_ms: u16,
-    pub throttle_value_ms: u16,
-    pub setpoint_value: f32,
-    pub error_value: f32,
-    pub speed_value: f32,
-    pub kalman_values: [f32; 4],
+    pub event: LogEvent,
+}
+
+#[derive(Clone, Copy)]
+pub enum LogEvent {
+    Controller {
+        steer_value_us: u16,
+        throttle_value_us: u16,
+        setpoint_value_mps: f32,
+        error_value: f32,
+        kalman_values: [f32; 4],
+    },
+    HallDeltaT {
+        delta_t_us: u32,
+    },
+    Ultrasound {
+        distance0_cm: Option<u32>,
+        distance1_cm: Option<u32>,
+        distance2_cm: Option<u32>,
+    },
 }
 
 pub fn write_log_data(
@@ -25,43 +40,15 @@ pub fn write_log_data(
     mut serial: impl Mutex<T = SerialPort<'static, MyUsbBus>>,
 ) {
     let mut line: String<256> = String::new();
-    
+
     #[cfg(not(feature = "simple_csv"))]
     {
-        // VS Code Serial Plotter line format: ">name:value,name:value\r\n"
-        let _ = write!(
-            &mut line,
-            ">time_us:{}, steer_ms:{}, throttle_ms:{}, speed_mps:{:.4}, setpoint_mps:{:.4}, error:{:.4}, kalman0:{:.4}, kalman1:{:.4}, kalman2:{:.4}, kalman3:{:.4}\r\n",
-            data.timestamp,
-            data.steer_value_ms,
-            data.throttle_value_ms,
-            data.speed_value,
-            data.setpoint_value,
-            data.error_value,
-            data.kalman_values[0],
-            data.kalman_values[1],
-            data.kalman_values[2],
-            data.kalman_values[3],
-        );
+        format_plotter_line(&mut line, data);
     }
-    
+
     #[cfg(feature = "simple_csv")]
     {
-        // Simple CSV format: value,value,value\r\n
-        let _ = write!(
-            &mut line,
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\r\n",
-            data.timestamp,
-            data.steer_value_ms,
-            data.throttle_value_ms,
-            data.speed_value,
-            data.setpoint_value,
-            data.error_value,
-            data.kalman_values[0],
-            data.kalman_values[1],
-            data.kalman_values[2],
-            data.kalman_values[3],
-        );
+        format_csv_line(&mut line, data);
     }
 
     (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
@@ -103,4 +90,132 @@ pub fn write_log_data(
             defmt::trace!("DTR not set - host may not have opened the port");
         }
     });
+}
+
+#[cfg(not(feature = "simple_csv"))]
+fn format_plotter_line(line: &mut String<256>, data: LogData) {
+    let _ = write!(line, ">time_us:{}", data.timestamp.ticks());
+
+    match data.event {
+        LogEvent::Controller {
+            steer_value_us,
+            throttle_value_us,
+            setpoint_value_mps,
+            error_value,
+            kalman_values,
+        } => {
+            push_named_u16(line, "steer_us", steer_value_us);
+            push_named_u16(line, "throttle_us", throttle_value_us);
+            push_named_f32(line, "setpoint_mps", setpoint_value_mps);
+            push_named_f32(line, "error", error_value);
+            push_named_f32(line, "kalman0", kalman_values[0]);
+            push_named_f32(line, "kalman1", kalman_values[1]);
+            push_named_f32(line, "kalman2", kalman_values[2]);
+            push_named_f32(line, "kalman3", kalman_values[3]);
+        }
+        LogEvent::HallDeltaT { delta_t_us } => {
+            push_named_u32(line, "delta_t_us", delta_t_us);
+        }
+        LogEvent::Ultrasound {
+            distance0_cm,
+            distance1_cm,
+            distance2_cm,
+        } => {
+            push_named_opt_u32(line, "distance0_cm", distance0_cm);
+            push_named_opt_u32(line, "distance1_cm", distance1_cm);
+            push_named_opt_u32(line, "distance2_cm", distance2_cm);
+        }
+    }
+
+    let _ = write!(line, "\r\n");
+}
+
+#[cfg(feature = "simple_csv")]
+fn format_csv_line(line: &mut String<256>, data: LogData) {
+    // Stable column order:
+    // time_us,event,steer_us,throttle_us,setpoint_mps,error,delta_t_us,
+    // kalman0,kalman1,kalman2,kalman3,distance0_cm,distance1_cm,distance2_cm
+    match data.event {
+        LogEvent::Controller {
+            steer_value_us,
+            throttle_value_us,
+            setpoint_value_mps,
+            error_value,
+            kalman_values,
+        } => {
+            let _ = write!(
+                line,
+                "{},controller,{},{},{:.4},{:.4},",
+                data.timestamp.ticks(),
+                steer_value_us,
+                throttle_value_us,
+                setpoint_value_mps,
+                error_value,
+            );
+            let _ = write!(line, "null");
+            let _ = write!(
+                line,
+                ",{:.4},{:.4},{:.4},{:.4},null,null,null\r\n",
+                kalman_values[0], kalman_values[1], kalman_values[2], kalman_values[3],
+            );
+        }
+        LogEvent::HallDeltaT { delta_t_us } => {
+            let _ = write!(
+                line,
+                "{},hall_delta_t,null,null,null,null,",
+                data.timestamp.ticks()
+            );
+            let _ = write!(line, "{}", delta_t_us);
+            let _ = write!(line, ",null,null,null,null,null,null,null\r\n");
+        }
+        LogEvent::Ultrasound {
+            distance0_cm,
+            distance1_cm,
+            distance2_cm,
+        } => {
+            let _ = write!(
+                line,
+                "{},ultrasound,null,null,null,null,null,",
+                data.timestamp.ticks()
+            );
+            let _ = write!(line, "null,null,null,null,");
+            push_csv_opt_u32(line, distance0_cm);
+            let _ = write!(line, ",");
+            push_csv_opt_u32(line, distance1_cm);
+            let _ = write!(line, ",");
+            push_csv_opt_u32(line, distance2_cm);
+            let _ = write!(line, "\r\n");
+        }
+    }
+}
+
+#[cfg(not(feature = "simple_csv"))]
+fn push_named_u16(line: &mut String<256>, name: &str, value: u16) {
+    let _ = write!(line, ",{}:{}", name, value);
+}
+
+#[cfg(not(feature = "simple_csv"))]
+fn push_named_u32(line: &mut String<256>, name: &str, value: u32) {
+    let _ = write!(line, ",{}:{}", name, value);
+}
+
+#[cfg(not(feature = "simple_csv"))]
+fn push_named_f32(line: &mut String<256>, name: &str, value: f32) {
+    let _ = write!(line, ",{}:{:.4}", name, value);
+}
+
+#[cfg(not(feature = "simple_csv"))]
+fn push_named_opt_u32(line: &mut String<256>, name: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        let _ = write!(line, ",{}:{}", name, value);
+    }
+}
+
+#[cfg(feature = "simple_csv")]
+fn push_csv_opt_u32(line: &mut String<256>, value: Option<u32>) {
+    if let Some(value) = value {
+        let _ = write!(line, "{}", value);
+    } else {
+        let _ = write!(line, "null");
+    }
 }

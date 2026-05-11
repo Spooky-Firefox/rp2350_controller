@@ -310,8 +310,7 @@ mod app {
                     .measured_speed_mps
                     .lock(|speed| *speed = measured_speed_mps);
 
-                // Steering is stubbed to 0.0 for now.
-                let event = ipc::SensorEvent::encoder(now.ticks(), 0.0, time_diff.ticks() as f32);
+                let event = ipc::SensorEvent::encoder(now.ticks(), time_diff.ticks() as f32);
                 ctx.shared.sensor_q_tx.lock(|q| {
                     if q.enqueue(event).is_err() {
                         defmt::warn!("sensor_q full, encoder event dropped");
@@ -343,7 +342,7 @@ mod app {
 
             if now.saturating_sub(last_sensor_irq_us) >= 100_000 {
                 ctx.shared.measured_speed_mps.lock(|speed| *speed = 0.0);
-                let event = ipc::SensorEvent::encoder_timeout(now, 0.0);
+                let event = ipc::SensorEvent::encoder_timeout(now);
                 ctx.shared.sensor_q_tx.lock(|q| {
                     if q.enqueue(event).is_err() {
                         defmt::warn!("sensor_q full, timeout event dropped");

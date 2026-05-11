@@ -5,22 +5,79 @@ pub trait Controller {
     fn set_speed_setpoint(&mut self, setpoint_mps: f32);
 }
 
-pub struct StraightLineSpeedController {
+#[derive(Clone, Copy, Debug)]
+pub struct Pid {
     pub kp: f32,
     pub ki: f32,
     pub kd: f32,
-    pub distance_setpoint_m: f32,
-    pub measured_distance_m: f32,
+    pub integral_limit: f32,
     pub integral_error: f32,
     pub previous_error: f32,
-    pub integral_limit: f32,
-    pub steering_pwm_us: u16,
-    pub neutral_power_pwm_us: u16,
-    /// Last computed PID terms — populated by `update`, read for telemetry.
     pub last_error: f32,
     pub last_proportional: f32,
     pub last_integral: f32,
     pub last_derivative: f32,
+}
+
+impl Pid {
+    pub const fn new(kp: f32, ki: f32, kd: f32, integral_limit: f32) -> Self {
+        Self {
+            kp,
+            ki,
+            kd,
+            integral_limit,
+            integral_error: 0.0,
+            previous_error: 0.0,
+            last_error: 0.0,
+            last_proportional: 0.0,
+            last_integral: 0.0,
+            last_derivative: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, error: f32, step: f32) -> f32 {
+        if step > 0.0 {
+            self.integral_error += error * step;
+            self.integral_error = self
+                .integral_error
+                .clamp(-self.integral_limit, self.integral_limit);
+        }
+
+        let derivative = if step > 0.0 {
+            (error - self.previous_error) / step
+        } else {
+            0.0
+        };
+        self.previous_error = error;
+
+        self.last_error = error;
+        self.last_proportional = self.kp * error;
+        self.last_integral = self.ki * self.integral_error;
+        self.last_derivative = self.kd * derivative;
+
+        self.output()
+    }
+
+    pub fn output(&self) -> f32 {
+        self.last_proportional + self.last_integral + self.last_derivative
+    }
+
+    pub fn reset(&mut self) {
+        self.integral_error = 0.0;
+        self.previous_error = 0.0;
+        self.last_error = 0.0;
+        self.last_proportional = 0.0;
+        self.last_integral = 0.0;
+        self.last_derivative = 0.0;
+    }
+}
+
+pub struct StraightLineSpeedController {
+    pub pid: Pid,
+    pub distance_setpoint_m: f32,
+    pub measured_distance_m: f32,
+    pub steering_pwm_us: u16,
+    pub neutral_power_pwm_us: u16,
 }
 
 impl Controller for StraightLineSpeedController {
@@ -32,30 +89,10 @@ impl Controller for StraightLineSpeedController {
             "Distance inc: {} m, Distance: {} m, Setpoint: {} m, Error: {} m",
             distance_increment_m, self.measured_distance_m, self.distance_setpoint_m, error
         );
-        if dt_s > 0.0 {
-            self.integral_error += error * dt_s;
-            self.integral_error = self
-                .integral_error
-                .clamp(-self.integral_limit, self.integral_limit);
-        }
+        let pid_output = self.pid.update(error, dt_s);
 
-        let derivative = if dt_s > 0.0 {
-            (error - self.previous_error) / dt_s
-        } else {
-            0.0
-        };
-        self.previous_error = error;
-
-        self.last_error = error;
-        self.last_proportional = self.kp * error;
-        self.last_integral = self.ki * self.integral_error;
-        self.last_derivative = self.kd * derivative;
-
-        let power_pwm = (self.neutral_power_pwm_us as f32
-            + self.last_proportional
-            + self.last_integral
-            + self.last_derivative)
-            .clamp(1500.0, 2000.0) as u16;
+        let power_pwm =
+            (self.neutral_power_pwm_us as f32 + pid_output).clamp(1500.0, 2000.0) as u16;
 
         [self.steering_pwm_us, power_pwm]
     }
@@ -65,94 +102,36 @@ impl Controller for StraightLineSpeedController {
     }
 }
 
-/// PID controller for steering based on distance sensor input.
-/// Uses three HC-SR04 sensors (left, center, right) to steer around obstacles.
-/// Computes error as the difference between left and right distances.
-pub struct SteeringDistanceController {
-    pub kp: f32,
-    pub ki: f32,
-    pub kd: f32,
-    pub integral_error: f32,
-    pub previous_error: f32,
-    pub integral_limit: f32,
+/// PID controller for steering-angle tracking.
+///
+/// The current setpoint is fixed at straight-ahead (`0.0` rad). A future
+/// wall-following or path planner can set `angle_setpoint_rad` instead of
+/// directly commanding PWM.
+pub struct SteeringAngleController {
+    pub pid: Pid,
+    pub angle_setpoint_rad: f32,
     pub neutral_steering_pwm_us: u16,
-    /// Activate steering only when center sensor reads **above** this threshold [cm]
-    /// (i.e. the path ahead is clear).  When something is close in front, the
-    /// controller returns neutral to avoid fighting an obstacle.
-    pub min_distance_cm: f32,
-    /// Last computed PID terms — populated by `update`, read for telemetry.
-    pub last_error: f32,
-    pub last_proportional: f32,
-    pub last_integral: f32,
-    pub last_derivative: f32,
+    pub min_steering_pwm_us: u16,
+    pub max_steering_pwm_us: u16,
 }
 
-impl SteeringDistanceController {
-    /// Update steering based on distance sensor readings.
-    /// Takes distances from left, center, and right HC-SR04 sensors [cm].
-    /// Returns steering PWM value [µs] (1200–1800 range).
-    pub fn update(
-        &mut self,
-        dist_left_cm: f32,
-        dist_center_cm: f32,
-        dist_right_cm: f32,
-        dt_s: f32,
-    ) -> u16 {
-        let center_valid = dist_center_cm.is_finite() && dist_center_cm > 0.0;
+impl SteeringAngleController {
+    /// Update steering using distance travelled as the PID step basis.
+    ///
+    /// Raw sensor angle is used as the process variable for now. Once the EKF
+    /// heading estimate is trustworthy, pass that angle here instead.
+    pub fn update(&mut self, measured_angle_rad: f32, distance_increment_m: f32) -> u16 {
+        let error = self.angle_setpoint_rad - measured_angle_rad;
+        let steering_output = self.pid.update(error, distance_increment_m);
 
-        // Active only when the path ahead is clear (center >= min_distance_cm).
-        // If something is close in front, return neutral to avoid fighting the obstacle.
-        if !center_valid || dist_center_cm < self.min_distance_cm {
-            self.last_error = 0.0;
-            self.last_proportional = 0.0;
-            self.last_integral = 0.0;
-            self.last_derivative = 0.0;
-            return self.neutral_steering_pwm_us;
-        }
-
-        // Error: positive → steer right (obstacle on left), negative → steer left.
-        let left_valid = dist_left_cm.is_finite() && dist_left_cm > 0.0;
-        let right_valid = dist_right_cm.is_finite() && dist_right_cm > 0.0;
-        let error = if left_valid && right_valid {
-            dist_right_cm - dist_left_cm
-        } else if left_valid {
-            50.0
-        } else if right_valid {
-            -50.0
-        } else {
-            0.0
-        };
-
-        if dt_s > 0.0 {
-            self.integral_error += error * dt_s;
-            self.integral_error = self
-                .integral_error
-                .clamp(-self.integral_limit, self.integral_limit);
-        }
-
-        let derivative = if dt_s > 0.0 {
-            (error - self.previous_error) / dt_s
-        } else {
-            0.0
-        };
-        self.previous_error = error;
-
-        self.last_error = error;
-        self.last_proportional = self.kp * error;
-        self.last_integral = self.ki * self.integral_error;
-        self.last_derivative = self.kd * derivative;
-
-        let steering_output = self.last_proportional + self.last_integral + self.last_derivative;
-        (self.neutral_steering_pwm_us as f32 + steering_output).clamp(1200.0, 1800.0) as u16
+        (self.neutral_steering_pwm_us as f32 + steering_output).clamp(
+            self.min_steering_pwm_us as f32,
+            self.max_steering_pwm_us as f32,
+        ) as u16
     }
 
     /// Reset controller state.
     pub fn reset(&mut self) {
-        self.integral_error = 0.0;
-        self.previous_error = 0.0;
-        self.last_error = 0.0;
-        self.last_proportional = 0.0;
-        self.last_integral = 0.0;
-        self.last_derivative = 0.0;
+        self.pid.reset();
     }
 }

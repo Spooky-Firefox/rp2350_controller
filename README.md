@@ -11,7 +11,7 @@
 Firmware for an RP2350-based controller with:
 
 - Core 0 RTIC tasks for USB, encoder interrupts, PWM output, and inter-core messaging
-- Core 1 processing for state estimation and speed control
+- Core 1 processing for speed control and camera-angle-based steering
 - Three HC-SR04 ultrasonic sensors measured in hardware
 - Split SIO FIFO signalling with typed SPSC queues for inter-core communication
 - Structured USB telemetry for controller, Hall, and ultrasound events
@@ -28,7 +28,7 @@ Firmware for an RP2350-based controller with:
 - Configured system clock: `150 MHz`
 - Core split: Core 0 handles I/O and scheduling, Core 1 runs estimation and control
 
-The current firmware assumes the Hall sensor produces one timing event per magnet pass and converts pulse period into longitudinal speed before handing it to the estimator.
+The current firmware assumes the Hall sensor produces one timing event per magnet pass and converts pulse period into longitudinal speed before handing it to Core 1. Steering currently tracks the latest `CameraAlign` angle with a distance-stepped PID; the EKF plumbing remains in place but is not yet the trusted steering-angle source.
 
 ## Start Here
 
@@ -97,8 +97,11 @@ Commands are newline-terminated ASCII strings received over the USB CDC serial p
 | `pwm-a <microseconds>` | `pwm-a 1600` | Set PWM channel A directly |
 | `pwm-b <microseconds>` | `pwm-b 1500` | Set PWM channel B directly |
 | `speed <m/s>` | `speed 0.40` | Update the Core 1 speed setpoint |
+| `const steering_kp <value>` | `const steering_kp 50` | Update the Core 1 steering PID gain |
 | `mode manual` | `mode manual` | Keep direct host PWM commands active |
 | `mode auto` | `mode auto` | Allow Core 0 to apply control outputs from Core 1 |
+
+The `align <angle> <confidence>` command is also forwarded to Core 1 and updates the latest camera-derived steering angle used by the steering PID.
 
 The default is `mode manual`, which prevents Core 0 from applying controller outputs received from Core 1 until auto mode is selected.
 
@@ -106,7 +109,7 @@ The default is `mode manual`, which prevents Core 0 from applying controller out
 
 | Event family | Produced by | Notes |
 | ------------ | ----------- | ----- |
-| `controller` | Core 1 | Steer PWM, throttle PWM, setpoint, error, and Kalman state |
+| `controller` | Core 1 | Steer PWM, throttle PWM, setpoint, speed-controller error, and Kalman state |
 | `hall_delta_t` | Core 0 | Hall timing events from the encoder path |
 | `ultrasound` | Core 0 | Three HC-SR04 distance readings |
 

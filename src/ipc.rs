@@ -82,12 +82,9 @@ impl TryFrom<&str> for Constants {
 #[derive(Clone, Copy, Debug)]
 pub enum SensorKind {
     Encoder {
-        steer: f32,
         rpm_period_us: f32,
     },
-    EncoderTimeout {
-        steer: f32,
-    },
+    EncoderTimeout,
     Distances {
         left_cm: f32,
         center_cm: f32,
@@ -110,20 +107,17 @@ pub struct SensorEvent {
 }
 
 impl SensorEvent {
-    pub fn encoder(timestamp_us: u64, steer: f32, rpm_period_us: f32) -> Self {
+    pub fn encoder(timestamp_us: u64, rpm_period_us: f32) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            kind: SensorKind::Encoder {
-                steer,
-                rpm_period_us,
-            },
+            kind: SensorKind::Encoder { rpm_period_us },
         }
     }
 
-    pub fn encoder_timeout(timestamp_us: u64, steer: f32) -> Self {
+    pub fn encoder_timeout(timestamp_us: u64) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            kind: SensorKind::EncoderTimeout { steer },
+            kind: SensorKind::EncoderTimeout,
         }
     }
 

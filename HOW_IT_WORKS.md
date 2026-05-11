@@ -8,7 +8,7 @@ The program does five things:
 
 1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
 2. **Measures rotation speed** from a Hall-effect encoder (GPIO 18)
-3. **Runs a Kalman-filtered speed controller + wall-following steering** on a dedicated second CPU core
+3. **Runs a speed controller plus camera-angle steering PID** on a dedicated second CPU core
 4. **Polls three HC-SR04 ultrasonic sensors** for wall distance and sends readings to Core 1
 5. **Receives commands** from a PC over USB serial
 
@@ -60,7 +60,7 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
  │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
  │  - encoder ISR           │ Events  │  - Kalman filter         │
  │  - USB serial            │         │  - PID speed controller  │
- │  - PWM output            │ <────── │  - Wall-following PID    │
+│  - PWM output            │ <────── │  - Camera-angle steering PID │
  │  - sensor timeout        │ Control │                          │
  │  - ultrasound scan       │ Events  │                          │
  └──────────────────────────┘         └──────────────────────────┘
@@ -97,8 +97,8 @@ Rather than a flat struct with a `values: [f32; 4]` array (where unused slots we
 
 | Variant | Fields | Sent by |
 | ------- | ------ | ------- |
-| `Encoder` | `steer`, `rpm_period_us` | `gpio_interrupt` on each encoder pulse |
-| `EncoderTimeout` | `steer` | `sensor_timeout` after 100 ms silence |
+| `Encoder` | `rpm_period_us` | `gpio_interrupt` on each encoder pulse |
+| `EncoderTimeout` | none | `sensor_timeout` after 100 ms silence |
 | `Distances` | `left_cm`, `center_cm`, `right_cm` | `ultrasound_scan` after each 3-sensor sweep |
 | `ConstantUpdate` | `constant`, `value` | `usb_interrupt` for runtime tuning commands |
 | `CameraAlign` | `angle`, `confidence` | `usb_interrupt` for raw camera alignment input |
@@ -113,13 +113,32 @@ Core 1 owns the actual controller state. When a `ConstantUpdate` arrives, Core 1
 
 - `SpeedSetpoint` updates the straight-line controller target
 - `SpeedKp`, `SpeedKi`, `SpeedKd` tune the speed PID
-- `SteeringKp`, `SteeringKi`, `SteeringKd` tune the wall-following PID
+- `SteeringKp`, `SteeringKi`, `SteeringKd` tune the steering-angle PID
 
 Core 0 does not cache or deduplicate these values anymore; it only parses the USB command and forwards the event.
 
 #### Camera alignment delivery
 
-The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. This is treated as a raw camera observation, not a final fused heading estimate. Core 1 receives it so the value can later be combined with the EKF instead of being trusted directly.
+The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. Core 1 stores the latest angle from that event and uses it as the steering PID process variable. The confidence value is carried along for future filtering/fusion work, but it is not yet used in the live control law.
+
+At the moment, the EKF is not the trusted steering-angle source. The loop therefore uses a simple rule:
+
+- if a new `CameraAlign` angle has been seen, steer from that latest angle
+- otherwise fall back to the filter heading value
+
+This keeps the interface ready for future fusion without blocking the current steering path on unfinished EKF work.
+
+#### Core 1 event flow
+
+Core 1 now follows the same high-level sequence on every `SensorReady` event:
+
+1. dequeue one `SensorEvent`
+2. update internal state from that event
+3. run the current predict step
+4. recompute control outputs
+5. emit a fresh `ControlOutput` and `LogData`
+
+For `Encoder`, the predict step uses the new speed measurement and advances the steering PID by one encoder-distance increment. For `EncoderTimeout`, `CameraAlign`, `ConstantUpdate`, and `Distances`, Core 1 performs a predict-only step and re-emits control using the latest known camera angle. This is why Core 0's timeout event is sufficient to keep the controller alive during encoder silence; no separate Core 1 tick is required.
 
 #### Queues
 
@@ -329,11 +348,11 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 The `const` command accepts these constant names:
 - `speed`, `setpoint`, `speed_setpoint` — target speed in m/s
 - `speed_kp`, `speed_ki`, `speed_kd` — speed controller PID gains
-- `steering_kp`, `steering_ki`, `steering_kd` — wall-following controller PID gains
+- `steering_kp`, `steering_ki`, `steering_kd` — steering-angle PID gains
 
 Commands must end with a newline (`\n`). PWM values are capped at the 20 000 µs frame period, and the controller itself later clamps output to the usual servo range of roughly 1000-2000 µs.
 
-`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `const` updates send a `ConstantUpdate` sensor event to Core 1, which applies the change to its controller state. `align` sends a `CameraAlign` event for EKF fusion.
+`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `const` updates send a `ConstantUpdate` sensor event to Core 1, which applies the change to its controller state. `align` sends a `CameraAlign` event that updates the latest steering-angle measurement used by the steering PID.
 
 ---
 
@@ -393,7 +412,7 @@ Core 1 (control loop)           Core 0 (I/O)
 Each log line is sent in **VS Code Serial Plotter format**, prefixed with `>` and containing comma-separated `name:value` pairs:
 
 ```
->time_us:12345678, steer_ms:1500, throttle_ms:1500, speed_mps:0.5234, setpoint_mps:0.5000, error:0.0234, kalman0:0.5200, kalman1:0.0012, kalman2:0.0001, kalman3:-0.0003
+>time_us:12345678,steer_us:1500,throttle_us:1500,setpoint_mps:0.5000,error:0.0234,kalman0:0.5200,kalman1:0.0012,kalman2:0.0001,kalman3:-0.0003
 ```
 
 This data is automatically plotted by VS Code's Serial Plotter extension when it detects a running terminal on the serial port.

@@ -13,7 +13,7 @@ Firmware for an RP2350-based controller with:
 - Core 0 RTIC tasks for USB, encoder interrupts, PWM output, and inter-core messaging
 - Core 1 processing for state estimation and speed control
 - Three HC-SR04 ultrasonic sensors measured in hardware
-- A typed FIFO IPC layer built on `rp235x-hal`
+- Split SIO FIFO signalling with typed SPSC queues for inter-core communication
 - Structured USB telemetry for controller, Hall, and ultrasound events
 
 ## Hardware Notes

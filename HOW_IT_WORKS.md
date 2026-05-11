@@ -7,7 +7,7 @@ This program runs on an **RP2350 microcontroller** (the chip on a Raspberry Pi P
 The program does four things:
 
 1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
-2. **Measures rotation speed** from a Hall-effect encoder (GPIO 13)
+2. **Measures rotation speed** from a Hall-effect encoder (GPIO 18)
 3. **Runs a Kalman-filtered speed controller** on a dedicated second CPU core
 4. **Receives commands** from a PC over USB serial
 
@@ -25,7 +25,7 @@ Priority 4           │  sio_interrupt    — control output from Core 1
 Priority 3           │  gpio_interrupt   — encoder edge detected
 Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
-                     │  delay_update_setpoint — defer setpoint updates
+                     │  delay_update_setpoint — periodically toggles the debug setpoint
                      │  log_data         — send logging data to host
                      │  periodic_drain_log_data — trigger log buffer drain
                      │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
@@ -38,14 +38,14 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | ------ | ------- | ------------ |
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
-| `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
+| `toggle_led` | Every 250 ms | Blinks the onboard LED — visual "heartbeat" |
+| `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
 | `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
-| `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
+| `delay_update_setpoint` | Every 10 s | Periodically toggles the shared speed setpoint between `0.0` and `10.0` m/s for debug/testing |
 | `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
 | `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
-| `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
-| `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
+| `log_data` | Spawned by `periodic_drain_log_data` or `LogReady` | Drains buffered telemetry data and sends it over USB serial |
+| `periodic_drain_log_data` | Every 100 ms | Triggers `log_data` to drain the logging buffer and transmit |
 | `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
 
 ---
@@ -102,7 +102,7 @@ The two cores share data through **`heapless::spsc` lock-free queues**. The SIO 
 
 #### Why SPSC queues instead of raw FIFO?
 
-The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlEvent` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
+The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlOutput` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
 
 #### Why is `FifoTx` / `FifoRx` split?
 
@@ -274,7 +274,7 @@ The waker handoff uses an [`atomic_waker::AtomicWaker`](https://docs.rs/atomic-w
 
 ## Encoder — Measuring Speed
 
-A Hall-effect encoder detects magnets on a rotating shaft. Each time a magnet passes the sensor, the pin on GPIO 13 goes from low to high (a **rising edge**), triggering `gpio_interrupt`.
+A Hall-effect encoder detects magnets on a rotating shaft. Each time a magnet passes the sensor, the pin on GPIO 18 goes from low to high (a **rising edge**), triggering `gpio_interrupt`.
 
 The interrupt records the **time between two consecutive rising edges**. Speed is then:
 
@@ -325,7 +325,7 @@ ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
 
-For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a raw register block. Core 0 locks it before sending or receiving FIFO messages; Core 1 owns its own `FifoChannel` instance in its blocking loop.
+For cross-core traffic, Core 0 keeps separate `FifoTx` and `FifoRx` RTIC shared resources rather than one combined FIFO wrapper. That split gives transmit and receive distinct priority ceilings. Core 1 owns the HAL `SioFifo` in its blocking loop and exchanges single-word `IpcSignal` values directly.
 
 ---
 
@@ -389,7 +389,7 @@ The firmware is organized into several Rust modules:
 | `hc_sr04.rs` | HC-SR04 ultrasonic distance sensor driver (split ownership, async measurement) |
 | `logging.rs` | Telemetry logging and VS Code Serial Plotter formatting |
 | `utils.rs` | Utility functions (PWM tick conversion, time conversions) |
-| `ipc.rs` | Inter-process communication structures (`SensorEvent`, `ControlEvent`, `FifoChannel`) |
+| `ipc.rs` | Inter-core message types (`SensorEvent`, `ControlOutput`, `IpcSignal`) and split FIFO helpers (`FifoTx`, `FifoRx`) |
 | `usb_serial.rs` | USB device initialization and serial port handling |
 | `controller_processor/` | Core 1 control loop (Kalman filter, PID controller) |
 | `controller_processor/kalman_filter.rs` | Extended Kalman Filter implementation |
@@ -592,7 +592,7 @@ async fn toggle_led(...) -> ! {
 | File | Purpose |
 | ---- | ------- |
 | `src/main.rs` | Core 0 RTIC app: hardware setup, USB commands, PWM output, encoder interrupts |
-| `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlEvent`) and `FifoChannel` |
+| `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlOutput`, `IpcSignal`) and split FIFO helpers |
 | `src/controller_processor/controller_processor_loop.rs` | Core 1 event loop: receives sensor events, runs EKF + controller, sends PWM commands back |
 | `src/controller_processor/kalman_filter.rs` | Event-driven extended Kalman filter for dead reckoning and speed estimation |
 | `src/controller_processor/controller.rs` | Straight-line speed controller (PID-like) producing servo PWM commands |

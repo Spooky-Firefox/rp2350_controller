@@ -4,12 +4,13 @@
 
 This program runs on an **RP2350 microcontroller** (the chip on a Raspberry Pi Pico 2 board). Unlike a regular computer, a microcontroller has no operating system — our program *is* the only thing running. It starts at power-on and runs forever.
 
-The program does four things:
+The program does five things:
 
 1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
 2. **Measures rotation speed** from a Hall-effect encoder (GPIO 18)
-3. **Runs a Kalman-filtered speed controller** on a dedicated second CPU core
-4. **Receives commands** from a PC over USB serial
+3. **Runs a Kalman-filtered speed controller + wall-following steering** on a dedicated second CPU core
+4. **Polls three HC-SR04 ultrasonic sensors** for wall distance and sends readings to Core 1
+5. **Receives commands** from a PC over USB serial
 
 ---
 
@@ -61,9 +62,9 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
  │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
  │  - encoder ISR           │ Events  │  - Kalman filter         │
  │  - USB serial            │         │  - PID speed controller  │
- │  - PWM output            │ <────── │                          │
+ │  - PWM output            │ <────── │  - Wall-following PID    │
  │  - sensor timeout        │ Control │                          │
- │                          │ Events  │                          │
+ │  - ultrasound scan       │ Events  │                          │
  └──────────────────────────┘         └──────────────────────────┘
 ```
 

@@ -81,15 +81,26 @@ impl TryFrom<&str> for Constants {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SensorKind {
-    Encoder { steer: f32, rpm_period_us: f32 },
-    EncoderTimeout { steer: f32 },
+    Encoder {
+        steer: f32,
+        rpm_period_us: f32,
+    },
+    EncoderTimeout {
+        steer: f32,
+    },
     Distances {
         left_cm: f32,
         center_cm: f32,
         right_cm: f32,
     },
-    ConstantUpdate { constant: Constants, value: f32 },
-    CameraAlign { angle: f32, confidence: f32 },
+    ConstantUpdate {
+        constant: Constants,
+        value: f32,
+    },
+    CameraAlign {
+        angle: f32,
+        confidence: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

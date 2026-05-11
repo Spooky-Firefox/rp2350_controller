@@ -1,9 +1,11 @@
 //! Core 1 event loop for sensor processing and control.
 #![deny(unsafe_code)]
 
-use crate::controller_processor::controller::{Controller, StraightLineSpeedController};
+use crate::controller_processor::controller::{
+    Controller, StraightLineSpeedController, SteeringDistanceController,
+};
 use crate::controller_processor::kalman_filter;
-use crate::ipc::{self, IpcSignal, SensorEvent, TimeExtender};
+use crate::ipc::{self, Constants, IpcSignal, SensorKind, TimeExtender};
 use crate::logging::{LogData, LogEvent};
 
 use core::f32::consts::PI;
@@ -12,30 +14,19 @@ use heapless::spsc::{Consumer, Producer};
 use rp235x_hal as hal;
 
 /// Arc length per encoder magnet pulse [m].
-const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 300.0;
+const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 600.0;
 
-/// Entry point for Core 1.  Called from the RTIC `init` on Core 0 via
-/// `core.spawn(...)`.  Runs a blocking event loop that never returns.
-///
-/// This module does not deny unsafe, as it must steal the PAC SIO peripheral.
 pub fn core1_task(
     mut sensor_q_rx: Consumer<'static, ipc::SensorEvent, 4>,
     mut control_q_tx: Producer<'static, ipc::ControlOutput, 4>,
     mut log_q_tx: Producer<'static, LogData, 128>,
 ) -> ! {
-    // Core 1 steals the PAC peripheral (Peripherals::steal()). This is the standard
-    // pattern on RP2350 because SIO is per-core hardware: each core has its own SIO view.
-    // Safe because: (1) PAC prevents multi-core data races (SIO regs are not shared),
-    // (2) Core 0 doesn't access SIO (uses HAL singletons), (3) Core 1 accesses only its
-    // own SIO address space, mapped by the hardware to the executing core.
     #[allow(unsafe_code)]
     let sio = hal::Sio::new(unsafe { rp235x_pac::Peripherals::steal() }.SIO);
     let mut fifo = sio.fifo;
 
-    // Drain any stale FIFO data left over from boot / previous run.
     fifo.drain();
 
-    // ── Kalman filter constants ──────────────────────────────────────────
     let kalman_const = kalman_filter::EkfConst {
         l: 0.2,
         q_pos: 0.01,
@@ -47,12 +38,10 @@ pub fn core1_task(
     };
 
     let x0: [f32; 4] = [0.0; 4];
-
     let p0: [f32; 16] = [
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
 
-    // ── Controller ───────────────────────────────────────────────────────
     let mut controller = StraightLineSpeedController {
         kp: 75.0,
         ki: 5.0,
@@ -70,15 +59,28 @@ pub fn core1_task(
         last_derivative: 0.0,
     };
 
-    // Filter is lazily initialised on the first event so that t0 is correct.
+    let mut distance_controller = SteeringDistanceController {
+        kp: 50.0,
+        ki: 2.0,
+        kd: 5.0,
+        integral_error: 0.0,
+        previous_error: 0.0,
+        integral_limit: 100.0,
+        neutral_steering_pwm_us: 1500,
+        min_distance_cm: 30.0,
+        last_error: 0.0,
+        last_proportional: 0.0,
+        last_integral: 0.0,
+        last_derivative: 0.0,
+    };
+
     let mut filter: Option<kalman_filter::EkfFilter> = None;
     let mut time_ext = TimeExtender::new();
     let mut last_control_time_us: Option<u64> = None;
-    let mut last_setpoint_bits = f32::INFINITY.to_bits();
+    let mut current_setpoint_mps: f32 = 0.0;
+    let mut last_distance_pwm_us: u16 = 1500;
 
-    // ── Main event loop ──────────────────────────────────────────────────
     loop {
-        // Block until Core 0 signals that new data is available.
         let word = fifo.read_blocking();
         if let Some(IpcSignal::SensorReady) = IpcSignal::from_u32(word)
             && let Some(event) = sensor_q_rx.dequeue()
@@ -90,68 +92,115 @@ pub fn core1_task(
                 .unwrap_or(0.0);
             last_control_time_us = Some(t_us);
 
-            if event.setpoint_mps.to_bits() != last_setpoint_bits {
-                controller.set_speed_setpoint(event.setpoint_mps);
-                last_setpoint_bits = event.setpoint_mps.to_bits();
+            match event.kind {
+                SensorKind::ConstantUpdate { constant, value } => match constant {
+                    Constants::SpeedSetpoint => {
+                        current_setpoint_mps = value;
+                        controller.set_speed_setpoint(value);
+                    }
+                    Constants::SpeedKp => controller.kp = value,
+                    Constants::SpeedKi => controller.ki = value,
+                    Constants::SpeedKd => controller.kd = value,
+                    Constants::SteeringKp => distance_controller.kp = value,
+                    Constants::SteeringKi => distance_controller.ki = value,
+                    Constants::SteeringKd => distance_controller.kd = value,
+                },
+                SensorKind::CameraAlign { angle, confidence } => {
+                    let _ = (angle, confidence);
+                }
+                SensorKind::Distances {
+                    left_cm,
+                    center_cm,
+                    right_cm,
+                } => {
+                    last_distance_pwm_us =
+                        distance_controller.update(left_cm, center_cm, right_cm, dt_s);
+                }
+                SensorKind::Encoder { steer, rpm_period_us } => {
+                    let filt = filter.get_or_insert_with(|| {
+                        kalman_filter::EkfFilter::new(kalman_const, x0, p0, now)
+                    });
+
+                    let _measured_speed_mps =
+                        process_encoder_event(filt, steer, Some(rpm_period_us), now);
+                    let [_steer_pwm_us, power_pwm_us] =
+                        controller.update(LENGTH_PER_HAL_RISE_METERS, dt_s);
+                    let steer_pwm_us = last_distance_pwm_us;
+
+                    log_q_tx
+                        .enqueue(LogData {
+                            timestamp: now,
+                            event: LogEvent::Controller {
+                                steer_value_us: steer_pwm_us,
+                                throttle_value_us: power_pwm_us,
+                                setpoint_value_mps: current_setpoint_mps,
+                                error_value: controller.last_error,
+                                kalman_values: filt.state(),
+                            },
+                        })
+                        .ok();
+                    fifo.write_blocking(IpcSignal::LogReady as u32);
+
+                    control_q_tx
+                        .enqueue(ipc::ControlOutput {
+                            steer_pwm_us,
+                            power_pwm_us,
+                        })
+                        .ok();
+                    fifo.write_blocking(IpcSignal::ControlReady as u32);
+                }
+                SensorKind::EncoderTimeout { steer } => {
+                    let filt = filter.get_or_insert_with(|| {
+                        kalman_filter::EkfFilter::new(kalman_const, x0, p0, now)
+                    });
+
+                    let _measured_speed_mps = process_encoder_event(filt, steer, None, now);
+                    let [_steer_pwm_us, power_pwm_us] = controller.update(0.0, dt_s);
+                    let steer_pwm_us = last_distance_pwm_us;
+
+                    log_q_tx
+                        .enqueue(LogData {
+                            timestamp: now,
+                            event: LogEvent::Controller {
+                                steer_value_us: steer_pwm_us,
+                                throttle_value_us: power_pwm_us,
+                                setpoint_value_mps: current_setpoint_mps,
+                                error_value: controller.last_error,
+                                kalman_values: filt.state(),
+                            },
+                        })
+                        .ok();
+                    fifo.write_blocking(IpcSignal::LogReady as u32);
+
+                    control_q_tx
+                        .enqueue(ipc::ControlOutput {
+                            steer_pwm_us,
+                            power_pwm_us,
+                        })
+                        .ok();
+                    fifo.write_blocking(IpcSignal::ControlReady as u32);
+                }
             }
-
-            // Lazy-init filter on first event.
-            let filt = filter
-                .get_or_insert_with(|| kalman_filter::EkfFilter::new(kalman_const, x0, p0, now));
-
-            process_event(filt, &event, now);
-            let distance_increment_m = if event.values[1].is_finite() && event.values[1] > 0.0 {
-                LENGTH_PER_HAL_RISE_METERS
-            } else {
-                0.0
-            };
-
-            // Run the controller.
-            let [steer_pwm_us, power_pwm_us] = controller.update(distance_increment_m, dt_s);
-
-            // Push log data and signal Core 0.
-            log_q_tx
-                .enqueue(LogData {
-                    timestamp: now,
-                    event: LogEvent::Controller {
-                        steer_value_us: steer_pwm_us,
-                        throttle_value_us: power_pwm_us,
-                        setpoint_value_mps: event.setpoint_mps,
-                        error_value: controller.last_error,
-                        kalman_values: filt.state(),
-                    },
-                })
-                .ok();
-            fifo.write_blocking(IpcSignal::LogReady as u32);
-
-            // Push control output and signal Core 0.
-            control_q_tx
-                .enqueue(ipc::ControlOutput {
-                    steer_pwm_us,
-                    power_pwm_us,
-                })
-                .ok();
-            fifo.write_blocking(IpcSignal::ControlReady as u32);
         }
     }
 }
 
-/// Dispatch a [`SensorEvent`] to the appropriate EKF entry point.
-fn process_event(
+fn process_encoder_event(
     filter: &mut kalman_filter::EkfFilter,
-    event: &SensorEvent,
+    steer: f32,
+    rpm_period_us: Option<f32>,
     now: TimerInstantU64<1_000_000>,
-) {
-    let steer = event.values[0];
-    let rpm_period_us = event.values[1];
-
+) -> f32 {
     filter.set_control(steer, 0.0);
-    if rpm_period_us.is_finite() && rpm_period_us > 0.0 {
-        // Convert encoder edge period [µs] → longitudinal speed [m/s].
-        let period_s = rpm_period_us * 1e-6;
-        let speed_mps = LENGTH_PER_HAL_RISE_METERS / period_s;
-        filter.on_speed_sample(speed_mps, now);
-    } else {
-        filter.on_timeout(now);
+    match rpm_period_us {
+        Some(period_us) => {
+            let speed_mps = LENGTH_PER_HAL_RISE_METERS / (period_us * 1e-6);
+            filter.on_speed_sample(speed_mps, now);
+            speed_mps
+        }
+        None => {
+            filter.on_timeout(now);
+            0.0
+        }
     }
 }

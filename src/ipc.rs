@@ -3,7 +3,7 @@
 //!
 //! # Protocol
 //!
-//! Data is exchanged via `heapless::spsc` queues.  The SIO FIFO carries only
+//! Data is exchanged via `heapless::spsc` queues. The SIO FIFO carries only
 //! 1-word [`IpcSignal`] values that tell the receiving core which queue has
 //! new data.
 //!
@@ -27,23 +27,15 @@
 //! lower-priority task that holds the TX lock, preventing inter-core FIFO
 //! deadlocks.
 
+use core::convert::TryFrom;
 use rp235x_hal::sio::SioFifo;
 use rp235x_pac;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IPC signal words
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One-word signal sent over the SIO FIFO to notify the other core that new
-/// data is available in the corresponding SPSC queue.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcSignal {
-    /// Core 0 → Core 1: a [`SensorEvent`] has been pushed to the sensor queue.
     SensorReady = 1,
-    /// Core 1 → Core 0: a [`ControlOutput`] has been pushed to the control queue.
     ControlReady = 2,
-    /// Core 1 → Core 0: a log item has been pushed to the Core 1 log queue.
     LogReady = 3,
 }
 
@@ -58,62 +50,115 @@ impl IpcSignal {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Sensor event (Core 0 → Core 1 via SPSC)
-// ─────────────────────────────────────────────────────────────────────────────
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constants {
+    SpeedSetpoint = 0,
+    SpeedKp = 1,
+    SpeedKi = 2,
+    SpeedKd = 3,
+    SteeringKp = 4,
+    SteeringKi = 5,
+    SteeringKd = 6,
+}
 
-/// Sensor snapshot produced by Core 0 and consumed by Core 1.
+impl TryFrom<&str> for Constants {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "speed" | "setpoint" | "speed_setpoint" => Ok(Constants::SpeedSetpoint),
+            "speed_kp" => Ok(Constants::SpeedKp),
+            "speed_ki" => Ok(Constants::SpeedKi),
+            "speed_kd" => Ok(Constants::SpeedKd),
+            "steering_kp" => Ok(Constants::SteeringKp),
+            "steering_ki" => Ok(Constants::SteeringKi),
+            "steering_kd" => Ok(Constants::SteeringKd),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SensorKind {
+    Encoder {
+        steer: f32,
+        rpm_period_us: f32,
+    },
+    EncoderTimeout {
+        steer: f32,
+    },
+    Distances {
+        left_cm: f32,
+        center_cm: f32,
+        right_cm: f32,
+    },
+    ConstantUpdate {
+        constant: Constants,
+        value: f32,
+    },
+    CameraAlign {
+        angle: f32,
+        confidence: f32,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SensorEvent {
-    /// 32-bit microsecond timestamp (lower 32 bits of `MainMono::now()`).
     pub t32_us: u32,
-    /// Speed setpoint [m/s] for the straight-line speed controller.
-    pub setpoint_mps: f32,
-    /// Up to 4 sensor values.  Unused slots are `f32::INFINITY`.
-    pub values: [f32; 4],
+    pub kind: SensorKind,
 }
 
 impl SensorEvent {
-    pub fn rpm_and_steer(
-        timestamp_us: u64,
-        setpoint_mps: f32,
-        steer: f32,
-        rpm_period_us: f32,
-    ) -> Self {
+    pub fn encoder(timestamp_us: u64, steer: f32, rpm_period_us: f32) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            setpoint_mps,
-            values: [steer, rpm_period_us, f32::INFINITY, f32::INFINITY],
+            kind: SensorKind::Encoder {
+                steer,
+                rpm_period_us,
+            },
         }
     }
 
-    pub fn steer_only_timeout(timestamp_us: u64, setpoint_mps: f32, steer: f32) -> Self {
+    pub fn encoder_timeout(timestamp_us: u64, steer: f32) -> Self {
         Self {
             t32_us: timestamp_us as u32,
-            setpoint_mps,
-            values: [steer, f32::INFINITY, f32::INFINITY, f32::INFINITY],
+            kind: SensorKind::EncoderTimeout { steer },
+        }
+    }
+
+    pub fn distances(timestamp_us: u64, left_cm: f32, center_cm: f32, right_cm: f32) -> Self {
+        Self {
+            t32_us: timestamp_us as u32,
+            kind: SensorKind::Distances {
+                left_cm,
+                center_cm,
+                right_cm,
+            },
+        }
+    }
+
+    pub fn constant_update(timestamp_us: u64, constant: Constants, value: f32) -> Self {
+        Self {
+            t32_us: timestamp_us as u32,
+            kind: SensorKind::ConstantUpdate { constant, value },
+        }
+    }
+
+    pub fn camera_align(timestamp_us: u64, angle: f32, confidence: f32) -> Self {
+        Self {
+            t32_us: timestamp_us as u32,
+            kind: SensorKind::CameraAlign { angle, confidence },
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Control output (Core 1 → Core 0 via SPSC)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Control output produced by Core 1 and consumed by Core 0 to drive the PWM.
 #[derive(Clone, Copy, Debug)]
 pub struct ControlOutput {
     pub steer_pwm_us: u16,
     pub power_pwm_us: u16,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 32-bit → 64-bit timestamp extension
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Reconstructs a monotonic `u64` µs timestamp from 32-bit wrapped values.
-///
-/// Works correctly as long as consecutive events are less than ~71.6 min apart.
 #[derive(Clone, Copy)]
 pub struct TimeExtender {
     initialized: bool,
@@ -130,7 +175,6 @@ impl TimeExtender {
         }
     }
 
-    /// Feed a 32-bit timestamp; returns the monotonic u64 µs value.
     pub fn extend(&mut self, t32: u32) -> u64 {
         if !self.initialized {
             self.initialized = true;
@@ -145,20 +189,10 @@ impl TimeExtender {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Core 0 split FIFO halves
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Core 0 write-only FIFO half: Core 0 → Core 1.
-///
-/// Shared only with tasks at priority ≤ 3, giving it an RTIC priority ceiling
-/// of 3.  `sio_interrupt` (priority 4) can always preempt any task that holds
-/// this lock, keeping Core 1's reply path unblocked.
 pub struct FifoTx;
 
 impl FifoTx {
     fn write_word_blocking(value: u32) {
-        // SAFETY: Only Core 0 writes to fifo_wr; no concurrent writers exist.
         let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
         while !sio.fifo_st().read().rdy().bit_is_set() {
             cortex_m::asm::nop();
@@ -167,24 +201,15 @@ impl FifoTx {
         cortex_m::asm::sev();
     }
 
-    /// Send a single [`IpcSignal`] word to Core 1 (blocking until FIFO has space).
     pub fn signal(&mut self, sig: IpcSignal) {
         Self::write_word_blocking(sig as u32);
     }
 }
 
-/// Core 0 read-only FIFO half: Core 1 → Core 0.
-///
-/// Used exclusively by `sio_interrupt` (priority 4).  Its RTIC priority
-/// ceiling is therefore 4, which allows `sio_interrupt` to preempt any task
-/// holding `FifoTx` (ceiling 3).
 pub struct FifoRx;
 
 impl FifoRx {
-    /// Try to read one word without blocking.  Returns `None` if the FIFO is
-    /// empty.
     pub fn try_read(&mut self) -> Option<u32> {
-        // SAFETY: Only Core 0 reads from fifo_rd; no concurrent readers.
         let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
         if sio.fifo_st().read().vld().bit_is_set() {
             Some(sio.fifo_rd().read().bits())
@@ -193,9 +218,7 @@ impl FifoRx {
         }
     }
 
-    /// Discard all words currently in the RX FIFO.
     pub fn drain(&mut self) {
-        // SAFETY: Only Core 0 reads from fifo_rd.
         let sio = unsafe { &(*rp235x_pac::SIO::ptr()) };
         while sio.fifo_st().read().vld().bit_is_set() {
             let _ = sio.fifo_rd().read().bits();
@@ -203,13 +226,7 @@ impl FifoRx {
     }
 }
 
-/// Consume the Core 0 [`SioFifo`] and produce separate [`FifoTx`] / [`FifoRx`]
-/// halves that live in independent RTIC shared resources, giving them distinct
-/// priority ceilings.
-pub fn split_fifo(fifo: SioFifo) -> (FifoTx, FifoRx) {
-    // The HAL SioFifo is consumed and dropped; FifoTx/FifoRx access the same
-    // hardware via direct PAC register reads/writes.
-    drop(fifo);
+pub fn split_fifo(_fifo: SioFifo) -> (FifoTx, FifoRx) {
     (FifoTx, FifoRx)
 }
 

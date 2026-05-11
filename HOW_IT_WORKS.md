@@ -26,10 +26,10 @@ Priority 4           │  sio_interrupt    — control output from Core 1
 Priority 3           │  gpio_interrupt   — encoder edge detected
 Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
-                     │  delay_update_setpoint — periodically toggles setpoint, sends SetpointUpdate
+                     │  delay_update_setpoint — periodically toggles the debug setpoint
                      │  log_data         — send logging data to host
                      │  periodic_drain_log_data — trigger log buffer drain
-                     │  ultrasound_scan  — poll 3 HC-SR04 sensors, send Distances event to Core 1
+                     │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -40,14 +40,14 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
 | `toggle_led` | Every 250 ms | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent::Encoder` to `sensor_q`, signals Core 1 |
-| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes `SensorEvent::EncoderTimeout` so the filter can coast |
-| `delay_update_setpoint` | Every 10 s | Toggles speed setpoint 0↔10 m/s, sends `SensorEvent::SetpointUpdate` to Core 1 |
+| `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
+| `delay_update_setpoint` | Every 10 s | Periodically toggles the shared speed setpoint between `0.0` and `10.0` m/s for debug/testing |
 | `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
-| `usb_interrupt` | USB data received | Reads commands, adjusts speed setpoint or PWM; sends `SensorEvent::SetpointUpdate` if the setpoint changed |
-| `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
-| `periodic_drain_log_data` | Every 100 ms | Signals `log_data` to drain the logging buffer and transmit |
-| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo, collects all 3 distances, sends `SensorEvent::Distances` to Core 1 |
+| `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
+| `log_data` | Spawned by `periodic_drain_log_data` or `LogReady` | Drains buffered telemetry data and sends it over USB serial |
+| `periodic_drain_log_data` | Every 100 ms | Triggers `log_data` to drain the logging buffer and transmit |
+| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
 
 ---
 
@@ -114,13 +114,13 @@ The speed setpoint is **only transmitted when it changes**, via `SensorKind::Set
 
 | Queue | Type | Depth | Producer | Consumer |
 | ----- | ---- | ----- | -------- | -------- |
-| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`, `ultrasound_scan`, `delay_update_setpoint`, `usb_interrupt`) | Core 1 |
+| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`) | Core 1 |
 | `control_q` | `ControlOutput` | 4 | Core 1 | Core 0 (`sio_interrupt`) |
 | `log_q` | `LogData` | 128 | Core 1 | Core 0 (`log_data`) |
 
 #### Why SPSC queues instead of raw FIFO?
 
-The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlEvent` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
+The SIO FIFO is only 8 words deep. Sending a single `SensorEvent` used to consume 6 of those 8 slots, and a `ControlOutput` could consume up to 5 more — making it trivial to overflow. The new design sends **exactly 1 FIFO word per event in each direction** regardless of payload size. Overflow of the SPSC queues silently drops the new entry (with a `defmt::warn!`) rather than blocking a core.
 
 #### Why is `FifoTx` / `FifoRx` split?
 
@@ -292,7 +292,7 @@ The waker handoff uses an [`atomic_waker::AtomicWaker`](https://docs.rs/atomic-w
 
 ## Encoder — Measuring Speed
 
-A Hall-effect encoder detects magnets on a rotating shaft. Each time a magnet passes the sensor, the pin on GPIO 13 goes from low to high (a **rising edge**), triggering `gpio_interrupt`.
+A Hall-effect encoder detects magnets on a rotating shaft. Each time a magnet passes the sensor, the pin on GPIO 18 goes from low to high (a **rising edge**), triggering `gpio_interrupt`.
 
 The interrupt records the **time between two consecutive rising edges**. Speed is then:
 
@@ -313,10 +313,12 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
 | `speed <m/s>` | `speed 1.2` | Set the speed controller target to 1.2 m/s |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
+| `mode manual` | `mode manual` | Keep direct PWM commands active and ignore Core 1 control outputs |
+| `mode auto` | `mode auto` | Allow Core 0 to apply control outputs received from Core 1 |
 
 Commands must end with a newline (`\n`). PWM values are capped at the 20 000 µs frame period, and the controller itself later clamps output to the usual servo range of roughly 1000-2000 µs.
 
-`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1.
+`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1. The firmware boots in manual mode, so Core 1 control outputs are ignored until `mode auto` is received.
 
 ---
 
@@ -341,27 +343,24 @@ ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
 
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
 
-For cross-core traffic, the shared RTIC resource is a typed `FifoChannel`, not a raw register block. Core 0 locks it before sending or receiving FIFO messages; Core 1 owns its own `FifoChannel` instance in its blocking loop.
+For cross-core traffic, Core 0 keeps separate `FifoTx` and `FifoRx` RTIC shared resources rather than one combined FIFO wrapper. That split gives transmit and receive distinct priority ceilings. Core 1 owns the HAL `SioFifo` in its blocking loop and exchanges single-word `IpcSignal` values directly.
 
 ---
 
 ## Real-Time Logging — Serial Plotter Integration
 
-The program continuously collects telemetry data and streams it to the host PC in **VS Code Serial Plotter format**. This allows real-time visualization of system state without special software.
+The program continuously collects telemetry data and streams it to the host PC over USB serial. Control telemetry is produced on Core 1, ultrasound telemetry is produced on Core 0, and one drain task on Core 0 forwards both queues to USB.
 
 ### Logging Pipeline
 
 ```text
 Core 1 (control loop)           Core 0 (I/O)
     │                               │
-    └─→ [log_data_producer] ───────→ Channel
+    ├─→ [core1 log queue] ──────────┤
+    │                               │
+    └─→ [ControlOutput queue]       ├─→ [core0 log queue from ultrasound]
                                     │
-                                ┌───┴───┐
-                                │       ├─→ [log_data_consumer ring buffer]
-                                │       │
-                                └───┬───┘
-                                    │
-                 [periodic_drain_log_data] (every 50 ms)
+                      [periodic_drain_log_data + LogReady]
                                     │
                                 [log_data task]
                                     │
@@ -372,19 +371,26 @@ Core 1 (control loop)           Core 0 (I/O)
 
 ### Format
 
-Each log line is sent in **VS Code Serial Plotter format**, prefixed with `>` and containing comma-separated `name:value` pairs:
+In normal mode, each log line is prefixed with `>` and contains only the fields that exist for that event:
 
 ```
->time_us:12345678, steer_ms:1500, throttle_ms:1500, speed_mps:0.5234, setpoint_mps:0.5000, error:0.0234, kalman0:0.5200, kalman1:0.0012, kalman2:0.0001, kalman3:-0.0003
+>time_us:12345678,steer_us:1500,throttle_us:1500,setpoint_mps:0.5000,error:0.0234,delta_t_us:19120,kalman0:0.5200,kalman1:0.0012,kalman2:0.0001,kalman3:-0.0003
+>time_us:12410000,distance0_cm:82,distance2_cm:79
 ```
 
-This data is automatically plotted by VS Code's Serial Plotter extension when it detects a running terminal on the serial port.
+With the `simple_csv` feature enabled, the firmware instead emits a fixed column order:
+
+```
+time_us,event,steer_us,throttle_us,setpoint_mps,error,delta_t_us,kalman0,kalman1,kalman2,kalman3,distance0_cm,distance1_cm,distance2_cm
+```
+
+Fields that do not apply to the current event are written as `null`.
 
 ### Key Implementation Details
 
-- **Core 1 produces data:** The control loop writes telemetry snapshots to a ring buffer via `log_data_producer`
-- **Core 0 consumes data:** The `log_data` task drains the buffer and formats it for USB transmission
-- **Throttled transmission:** Data is sent every 50 ms (20 Hz) by `periodic_drain_log_data`, preventing USB from being overwhelmed
+- **Two SPSC log queues:** one queue per core avoids deprecated MPMC patterns in `heapless`
+- **Core 0 drains both queues:** the `log_data` task formats mixed event types for USB transmission
+- **Throttled transmission:** `periodic_drain_log_data` runs every 100 ms, and Core 1 can also trigger an immediate drain with `LogReady`
 - **Async tasks:** Both `log_data` and `periodic_drain_log_data` are async tasks to avoid blocking higher-priority interrupts
 
 ---
@@ -401,7 +407,7 @@ The firmware is organized into several Rust modules:
 | `hc_sr04.rs` | HC-SR04 ultrasonic distance sensor driver (split ownership, async measurement) |
 | `logging.rs` | Telemetry logging and VS Code Serial Plotter formatting |
 | `utils.rs` | Utility functions (PWM tick conversion, time conversions) |
-| `ipc.rs` | Inter-process communication structures (`SensorEvent`, `ControlEvent`, `FifoChannel`) |
+| `ipc.rs` | Inter-core message types (`SensorEvent`, `ControlOutput`, `IpcSignal`) and split FIFO helpers (`FifoTx`, `FifoRx`) |
 | `usb_serial.rs` | USB device initialization and serial port handling |
 | `controller_processor/` | Core 1 control loop (Kalman filter, PID controller) |
 | `controller_processor/kalman_filter.rs` | Extended Kalman Filter implementation |
@@ -604,7 +610,7 @@ async fn toggle_led(...) -> ! {
 | File | Purpose |
 | ---- | ------- |
 | `src/main.rs` | Core 0 RTIC app: hardware setup, USB commands, PWM output, encoder interrupts |
-| `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlEvent`) and `FifoChannel` |
+| `src/ipc.rs` | Typed inter-core messages (`SensorEvent`, `ControlOutput`, `IpcSignal`) and split FIFO helpers |
 | `src/controller_processor/controller_processor_loop.rs` | Core 1 event loop: receives sensor events, runs EKF + controller, sends PWM commands back |
 | `src/controller_processor/kalman_filter.rs` | Event-driven extended Kalman filter for dead reckoning and speed estimation |
 | `src/controller_processor/controller.rs` | Straight-line speed controller (PID-like) producing servo PWM commands |

@@ -259,13 +259,24 @@ mod app {
         }
     }
 
-    #[task(shared = [speed_setpoint_mps], priority = 1)]
+    #[task(shared = [speed_setpoint_mps, fifo_tx, sensor_q_tx], priority = 1)]
     async fn delay_update_setpoint(mut ctx: delay_update_setpoint::Context) -> ! {
         loop {
             MainMono::delay(10.secs()).await;
-            ctx.shared
+            let new_setpoint = ctx.shared
                 .speed_setpoint_mps
-                .lock(|setpoint| *setpoint = if *setpoint == 0.0 { 10.0 } else { 0.0 });
+                .lock(|setpoint| {
+                    *setpoint = if *setpoint == 0.0 { 10.0 } else { 0.0 };
+                    *setpoint
+                });
+            let now_us = MainMono::now().ticks();
+            let event = ipc::SensorEvent::setpoint_update(now_us, new_setpoint);
+            ctx.shared.sensor_q_tx.lock(|q| {
+                if q.enqueue(event).is_err() {
+                    defmt::warn!("sensor_q full, setpoint event dropped");
+                }
+            });
+            ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
         }
     }
 
@@ -277,7 +288,7 @@ mod app {
         }
     }
 
-    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0, encoder, encoder_last_time, us0_irq, us1_irq, us2_irq], shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 3)]
+    #[task(binds = IO_IRQ_BANK0, local = [cnt: u32 = 0, encoder, encoder_last_time, us0_irq, us1_irq, us2_irq], shared = [measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 3)]
     fn gpio_interrupt(mut ctx: gpio_interrupt::Context) {
         trace!("gpio interrupt");
         *ctx.local.cnt += 1;
@@ -297,7 +308,6 @@ mod app {
 
             if previous.ticks() != 0 {
                 let time_diff = now - previous;
-                let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
                 let measured_speed_mps =
                     LENGTH_PER_ENCODER_PULSE_METERS / (time_diff.ticks() as f32 * 1e-6);
                 ctx.shared
@@ -305,9 +315,8 @@ mod app {
                     .lock(|speed| *speed = measured_speed_mps);
 
                 // Steering is stubbed to 0.0 for now.
-                let event = ipc::SensorEvent::rpm_and_steer(
+                let event = ipc::SensorEvent::encoder(
                     now.ticks(),
-                    setpoint_mps,
                     0.0,
                     time_diff.ticks() as f32,
                 );
@@ -332,7 +341,7 @@ mod app {
         ctx.local.us2_irq.on_interrupt();
     }
 
-    #[task(shared = [speed_setpoint_mps, measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 2)]
+    #[task(shared = [measured_speed_mps, last_sensor_irq_us, fifo_tx, sensor_q_tx], priority = 2)]
     async fn sensor_timeout(mut ctx: sensor_timeout::Context) -> ! {
         loop {
             MainMono::delay(100u64.millis()).await;
@@ -341,9 +350,8 @@ mod app {
             let last_sensor_irq_us = ctx.shared.last_sensor_irq_us.lock(|last| *last);
 
             if now.saturating_sub(last_sensor_irq_us) >= 100_000 {
-                let setpoint_mps = ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint);
                 ctx.shared.measured_speed_mps.lock(|speed| *speed = 0.0);
-                let event = ipc::SensorEvent::steer_only_timeout(now, setpoint_mps, 0.0);
+                let event = ipc::SensorEvent::encoder_timeout(now, 0.0);
                 ctx.shared.sensor_q_tx.lock(|q| {
                     if q.enqueue(event).is_err() {
                         defmt::warn!("sensor_q full, timeout event dropped");
@@ -419,52 +427,84 @@ mod app {
         }
     }
 
-    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial, pwm, speed_setpoint_mps], priority = 5)]
-    fn usb_interrupt(ctx: usb_interrupt::Context) {
+    #[task(binds = USBCTRL_IRQ, local = [buff: [u8; 64] = [0; 64], buff_len: usize = 0], shared = [usb_dev, serial, pwm, speed_setpoint_mps, fifo_tx, sensor_q_tx], priority = 5)]
+    fn usb_interrupt(mut ctx: usb_interrupt::Context) {
         trace!("USBCTRL_IRQ fired");
         let usb_dev = ctx.shared.usb_dev;
         let serial = ctx.shared.serial;
         let pwm = ctx.shared.pwm;
-        let speed_setpoint = ctx.shared.speed_setpoint_mps;
+        let mut speed_setpoint = ctx.shared.speed_setpoint_mps;
+
+        let old_setpoint = speed_setpoint.lock(|s| *s);
 
         let buff = ctx.local.buff;
         let buff_len = ctx.local.buff_len;
 
-        process_usb_command(usb_dev, serial, pwm, buff, buff_len, speed_setpoint);
+        process_usb_command(usb_dev, serial, pwm, buff, buff_len, &mut speed_setpoint);
+
+        // If the USB command changed the setpoint, notify Core 1.
+        let new_setpoint = speed_setpoint.lock(|s| *s);
+        if new_setpoint.to_bits() != old_setpoint.to_bits() {
+            let now_us = MainMono::now().ticks();
+            let event = ipc::SensorEvent::setpoint_update(now_us, new_setpoint);
+            ctx.shared.sensor_q_tx.lock(|q| {
+                if q.enqueue(event).is_err() {
+                    defmt::warn!("sensor_q full, setpoint event dropped");
+                }
+            });
+            ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
+        }
     }
 
-    /// Polls all three HC-SR04 sensors in sequence with a 60 ms gap between each.
-    ///
-    /// Uses `delay_until` with an absolute deadline so the inter-sensor spacing
-    /// does not drift over time regardless of how long each measurement takes.
-    /// RTT log shows the raw counter value (µs, since div_int=150 @ 150 MHz).
-    #[task(local = [us0, us1, us2], priority = 1)]
-    async fn ultrasound_scan(ctx: ultrasound_scan::Context) -> ! {
+    /// Polls all three HC-SR04 sensors in sequence with a 60 ms gap between each,
+    /// then sends a [`ipc::SensorEvent::distances`] to Core 1.
+    #[task(local = [us0, us1, us2], shared = [fifo_tx, sensor_q_tx], priority = 1)]
+    async fn ultrasound_scan(mut ctx: ultrasound_scan::Context) -> ! {
         use defmt::{info, warn};
         const TIMEOUT_US: u64 = 50_000;
         const INTER_SENSOR_DELAY_US: u64 = 60_000;
         let mut next = MainMono::now();
         loop {
-            match ctx.local.us0.measure::<MainMono>(TIMEOUT_US.micros()).await {
-                Ok(ticks) => info!("us0: {} us (~{} cm)", ticks, ticks as u32 / 58),
-                Err(_) => warn!("us0: timeout"),
-            }
+            let d0 = match ctx.local.us0.measure::<MainMono>(TIMEOUT_US.micros()).await {
+                Ok(ticks) => {
+                    info!("us0: {} us (~{} cm)", ticks, ticks as u32 / 58);
+                    ticks as f32 / 58.0
+                }
+                Err(_) => { warn!("us0: timeout"); f32::INFINITY }
+            };
             next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
-            match ctx.local.us1.measure::<MainMono>(TIMEOUT_US.micros()).await {
-                Ok(ticks) => info!("us1: {} us (~{} cm)", ticks, ticks as u32 / 58),
-                Err(_) => warn!("us1: timeout"),
-            }
+            let d1 = match ctx.local.us1.measure::<MainMono>(TIMEOUT_US.micros()).await {
+                Ok(ticks) => {
+                    info!("us1: {} us (~{} cm)", ticks, ticks as u32 / 58);
+                    ticks as f32 / 58.0
+                }
+                Err(_) => { warn!("us1: timeout"); f32::INFINITY }
+            };
             next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
 
-            match ctx.local.us2.measure::<MainMono>(TIMEOUT_US.micros()).await {
-                Ok(ticks) => info!("us2: {} us (~{} cm)", ticks, ticks as u32 / 58),
-                Err(_) => warn!("us2: timeout"),
-            }
+            let d2 = match ctx.local.us2.measure::<MainMono>(TIMEOUT_US.micros()).await {
+                Ok(ticks) => {
+                    info!("us2: {} us (~{} cm)", ticks, ticks as u32 / 58);
+                    ticks as f32 / 58.0
+                }
+                Err(_) => { warn!("us2: timeout"); f32::INFINITY }
+            };
             next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;
+
+            // Send all three readings to Core 1 as a single Distances event.
+            // us0 = left, us1 = center, us2 = right.
+            let now_us = MainMono::now().ticks();
+            let event = ipc::SensorEvent::distances(now_us, d0, d1, d2);
+            ctx.shared.sensor_q_tx.lock(|q| {
+                if q.enqueue(event).is_err() {
+                    warn!("sensor_q full, distance event dropped");
+                }
+            });
+            ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
         }
     }
 }

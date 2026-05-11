@@ -13,15 +13,12 @@ Core 1 does two jobs:
 1. Estimate the vehicle state from incomplete sensor data.
 2. Turn that estimate into actuator commands.
 
-In this project, the state estimator is an **Extended Kalman Filter (EKF)** and the actuator command logic is a simple **speed controller** with proportional, integral, and derivative terms.
+In this project, the state estimator is an **Extended Kalman Filter (EKF)**, the speed actuator logic is a **PID speed controller**, and steering is handled by a separate **wall-following PID controller** that uses three HC-SR04 distance sensors.
 
 The data flow is:
 
 ```text
-encoder pulse timing + setpoint
-            |
-            v
-       SensorEvent
+SensorEvent::Encoder / EncoderTimeout
             |
             v
    time extension + parsing
@@ -33,10 +30,17 @@ encoder pulse timing + setpoint
  estimated speed v_hat
             |
             v
-      PID-like controller
+  PID speed controller → power PWM
+
+SensorEvent::Distances (left, center, right)
             |
             v
-      PWM microseconds
+  Wall-following PID → steering PWM
+
+SensorEvent::SetpointUpdate
+            |
+            v
+  controller.set_speed_setpoint()
 ```
 
 ## Why Use a Kalman Filter Here?
@@ -196,10 +200,44 @@ In the implementation:
 
 The controller returns two values:
 
-- steering PWM in microseconds
+- steering PWM in microseconds (overridden by the wall-following controller)
 - power PWM in microseconds
 
-Right now the steering command is effectively fixed and the speed loop mainly drives throttle/power PWM.
+## Wall-Following Steering Controller
+
+Steering is handled by a separate `SteeringDistanceController` that runs independently of the EKF speed loop. It receives `SensorKind::Distances` events from Core 0, which carry left, center, and right HC-SR04 readings in centimetres.
+
+### Activation
+
+The controller is only active when the center sensor reads **above** `min_distance_cm` (default 30 cm), meaning the path ahead is clear. If something is close in front, the output is `neutral_steering_pwm_us` (1500 µs) and the wall-following PID is suspended — this avoids fighting an obstacle with steering corrections.
+
+### Error definition
+
+The error is the difference between the right and left distances:
+
+$$e = d_{right} - d_{left}$$
+
+- $e > 0$ means the right wall is farther away → steer right to center
+- $e < 0$ means the left wall is farther away → steer left to center
+
+If one sensor times out (returns `f32::INFINITY`), a fixed fallback error of ±50 cm is used to steer away from the working sensor's side.
+
+### Control law
+
+Standard PID, same form as the speed controller:
+
+$$u_{steer} = u_{neutral} + K_p e + K_i \int e\,dt + K_d \frac{de}{dt}$$
+
+Output is clamped to the 1200–1800 µs servo range.
+
+### Interaction with the speed loop
+
+The `SteeringDistanceController` and `StraightLineSpeedController` run on separate event paths in Core 1:
+
+- `Distances` events update `last_distance_pwm_us`
+- `Encoder` / `EncoderTimeout` events run the EKF + speed PID and then read `last_distance_pwm_us` for the final steer output
+
+This means steering updates arrive at ~5 Hz (three 60 ms sensor gaps) while speed control runs at encoder frequency. The two loops are loosely coupled and do not block each other.
 
 ## Why Estimate First, Then Control?
 

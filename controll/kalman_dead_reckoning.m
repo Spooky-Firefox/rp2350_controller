@@ -25,8 +25,19 @@
 % ============================================================
 clear; clc; close all;
 
-%% =================== LOAD GENERATED DATA ===================
+%% =================== RUN MODE ===================
+% 'sim'  -> original synthetic data pipeline
+% 'log'  -> run EKF directly on recorded CSV and compare to measured reality
 script_dir = fileparts(mfilename('fullpath'));
+RUN_MODE = 'log';
+LOG_FILE = fullfile(script_dir, 'actual_on_ground_data', 'log_20260509_114746.csv');
+
+if strcmpi(RUN_MODE, 'log')
+    run_dead_reckoning_on_log(LOG_FILE, script_dir);
+    return;
+end
+
+%% =================== LOAD GENERATED DATA ===================
 data_file = fullfile(script_dir, 'kalman_sim_data.mat');
 if ~isfile(data_file)
     generate_kalman_data(data_file);
@@ -41,7 +52,7 @@ CONST.L   = sim_data.plant.L;    % wheelbase [m]
 CONST.r_w = sim_data.plant.r_w;  % wheel radius [m]
 CONST.W   = sim_data.plant.W;    % track width [m] (info only)
 CONST.wheel_circumference = sim_data.plant.wheel_circumference;
-CONST.pulse_distance       = sim_data.plant.pulse_distance;
+CONST.pulse_distance       = 0.5 * sim_data.plant.pulse_distance;
 
 % --- Control-to-dynamics mapping ---
 CONST.throttle = sim_data.plant.throttle;
@@ -195,6 +206,177 @@ fprintf('Wheel increments directly advance pose by measured arc length.\n');
 %% =====================================================================
 %%                       LOCAL FUNCTIONS
 %% =====================================================================
+
+function run_dead_reckoning_on_log(log_file, script_dir)
+    if ~isfile(log_file)
+        error('Log file not found: %s', log_file);
+    end
+
+    data_file = fullfile(script_dir, 'kalman_sim_data.mat');
+    if ~isfile(data_file)
+        generate_kalman_data(data_file);
+    end
+    loaded = load(data_file, 'sim_data');
+    sim_data = loaded.sim_data;
+
+    T = readtable(log_file);
+    req = {'timestamp_us', 'steer_us', 'throttle_us'};
+    has_all = all(ismember(req, T.Properties.VariableNames));
+    if ~has_all
+        error('CSV must contain columns: %s', strjoin(req, ', '));
+    end
+
+    t_s = (double(T.timestamp_us) - double(T.timestamp_us(1))) * 1e-6;
+    keep = [true; diff(t_s) > 0];
+    t_s = t_s(keep);
+    pwm_steer = double(T.steer_us(keep));
+    pwm_throttle = double(T.throttle_us(keep));
+
+    N = numel(t_s);
+    if N < 3
+        error('Not enough valid samples in log for EKF run.');
+    end
+
+    CONST = struct();
+    CONST.L = sim_data.plant.L;
+    CONST.r_w = sim_data.plant.r_w;
+    CONST.W = sim_data.plant.W;
+    CONST.wheel_circumference = sim_data.plant.wheel_circumference;
+    CONST.pulse_distance = 0.5 * sim_data.plant.pulse_distance;
+    CONST.throttle = sim_data.plant.throttle;
+    CONST.steer = sim_data.plant.steer;
+
+    % Slightly conservative process noise for real-log run.
+    CONST.q_pos = 0.03;
+    CONST.q_theta = 0.06;
+    CONST.q_v = 1.2;
+
+    x_est = [0; 0; 0; 0];
+    P_est = diag([0.05^2, 0.05^2, deg2rad(3)^2, 0.6^2]);
+
+    x_hist = zeros(4, N);
+    P_diag = zeros(4, N);
+    delta_hist = zeros(1, N);
+    a_cmd_hist = zeros(1, N);
+    speed_from_dt = nan(N, 1);
+    v_innov = nan(1, N);
+
+    x_hist(:,1) = x_est;
+    P_diag(:,1) = diag(P_est);
+    delta_est = 0;
+    delta_dot_est = 0;
+
+    dt_nom = median(diff(t_s));
+    if ~isfinite(dt_nom) || dt_nom <= 0
+        dt_nom = 0.02;
+    end
+
+    for k = 2:N
+        dt = t_s(k) - t_s(k-1);
+        if ~isfinite(dt) || dt <= 1e-5 || dt > 0.30
+            dt = dt_nom;
+        end
+
+        [delta_est, delta_dot_est] = steering_actuator_step( ...
+            delta_est, delta_dot_est, pwm_steer(k-1), dt, CONST.steer);
+        a_cmd = throttle_pwm_to_accel(pwm_throttle(k-1), x_est(4), CONST.throttle);
+
+        u = [delta_est; a_cmd];
+        [x_est, P_est] = ekf_predict(x_est, P_est, u, dt, CONST);
+
+        if isfinite(dt) && dt > 1e-5
+            % Use encoder trigger interval directly: v = ds / dt.
+            v_m = CONST.pulse_distance / dt;
+            speed_from_dt(k) = v_m;
+
+            % Measurement noise from timestamp jitter propagation.
+            sigma_dt = max(sim_data.sensor.r_wheel_dt, 1e-4);
+            sigma_v = (CONST.pulse_distance / (dt^2)) * sigma_dt;
+            sigma_v = max(sigma_v, 0.05);
+            R_v = sigma_v^2;
+
+            v_innov(k) = v_m - x_est(4);
+            [x_est, P_est] = ekf_update_speed(x_est, P_est, v_m, R_v);
+        end
+
+        x_hist(:,k) = x_est;
+        P_diag(:,k) = diag(P_est);
+        delta_hist(k) = delta_est;
+        a_cmd_hist(k) = a_cmd;
+    end
+
+    speed_ekf = x_hist(4, :)';
+    first_valid_speed_idx = find(isfinite(speed_from_dt), 1, 'first');
+    if isempty(first_valid_speed_idx)
+        speed_from_dt(1) = 0;
+    else
+        speed_from_dt(1) = speed_from_dt(first_valid_speed_idx);
+    end
+
+    dist_meas = (0:N-1)' * CONST.pulse_distance;
+    dist_ekf = cumtrapz(t_s, speed_ekf);
+    dist_from_dt = cumtrapz(t_s, speed_from_dt);
+
+    rmse_speed = sqrt(mean((speed_ekf - speed_from_dt).^2, 'omitnan'));
+    rmse_dist = sqrt(mean((dist_ekf - dist_meas).^2, 'omitnan'));
+
+    figure('Name', 'EKF Dead Reckoning on Real Log', 'Position', [120 100 1300 820]);
+
+    subplot(2,3,1); hold on; grid on;
+    plot(t_s, speed_from_dt, 'k-', 'LineWidth', 1.3);
+    plot(t_s, speed_ekf, 'b--', 'LineWidth', 1.2);
+    fill_sigma(t_s', speed_ekf', sqrt(P_diag(4, :)), [0.6 0.8 1.0]);
+    xlabel('t [s]'); ylabel('v [m/s]');
+    title(sprintf('Speed Comparison (RMSE = %.3f m/s)', rmse_speed));
+    legend('Speed from encoder \Delta t', 'EKF speed', '\pm1\sigma', 'Location', 'best');
+
+    subplot(2,3,2); hold on; grid on;
+    plot(t_s, dist_meas, 'k-', 'LineWidth', 1.3);
+    plot(t_s, dist_ekf, 'b--', 'LineWidth', 1.2);
+    plot(t_s, dist_from_dt, 'm:', 'LineWidth', 1.1);
+    xlabel('t [s]'); ylabel('distance [m]');
+    title(sprintf('Distance Comparison (RMSE = %.3f m)', rmse_dist));
+    legend('Distance from pulse count', 'EKF distance = \int v_{ekf}dt', ...
+        'Distance from \int v_{\Delta t}dt', 'Location', 'best');
+
+    subplot(2,3,3); hold on; grid on;
+    plot(t_s, pwm_throttle, 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2);
+    plot(t_s, pwm_steer, 'Color', [0.00 0.45 0.74], 'LineWidth', 1.1);
+    yline(1500, '--', 'Neutral');
+    xlabel('t [s]'); ylabel('PWM [us]');
+    title('Control Inputs');
+    legend('Throttle', 'Steer', 'Location', 'best');
+
+    subplot(2,3,4); hold on; grid on;
+    plot(t_s, v_innov, 'r-', 'LineWidth', 1.0);
+    yline(0, ':k');
+    xlabel('t [s]'); ylabel('innovation [m/s]');
+    title('Speed Innovation: v_{\Delta t} - v_{pred}');
+
+    subplot(2,3,5); hold on; grid on;
+    plot(t_s, rad2deg(delta_hist), 'b-', 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('\delta [deg]');
+    title('Estimated Steering Angle');
+
+    subplot(2,3,6); hold on; grid on;
+    plot(t_s, x_hist(1, :), 'LineWidth', 1.2);
+    plot(t_s, x_hist(2, :), 'LineWidth', 1.2);
+    xlabel('t [s]'); ylabel('position [m]');
+    title('EKF Pose States (no absolute ground truth)');
+    legend('X_{ekf}', 'Y_{ekf}', 'Location', 'best');
+
+    sgtitle(sprintf('EKF Dead Reckoning on %s', log_file), 'Interpreter', 'none');
+
+    fprintf('\n--- EKF on Real Log (Encoder delta-time as Reality) ---\n');
+    fprintf('Log file                  : %s\n', log_file);
+    fprintf('Samples used              : %d\n', N);
+    fprintf('Speed RMSE (EKF vs delta-time): %.4f m/s\n', rmse_speed);
+    fprintf('Dist RMSE  (EKF vs pulses): %.4f m\n', rmse_dist);
+    fprintf('Final distance (pulses)   : %.3f m\n', dist_meas(end));
+    fprintf('Final distance (EKF)      : %.3f m\n', dist_ekf(end));
+    fprintf('\nNote: Without camera/GNSS, absolute X-Y reality is unavailable.\n');
+    fprintf('This comparison uses encoder-trigger timing and pulse count as reference.\n');
+end
 
 function [x_p, P_p] = ekf_predict(x, P, u, dt, C)
     theta = x(3);

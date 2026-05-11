@@ -6,13 +6,16 @@ function a_long = throttle_pwm_to_accel(pwm_us, v_current, cfg)
 %   pwm_us    : throttle command in microseconds [1000..2000]
 %   v_current : current vehicle speed [m/s]
 %   cfg       : optional struct with fields:
-%                 deadband_us, max_accel_fwd, max_accel_rev, drag_coeff
+%                 deadband_us, max_accel_fwd, max_accel_rev,
+%                 drag_k0 (rolling resistance [m/s^2]),
+%                 drag_k1 (viscous drag [1/s])
 
     if nargin < 3 || isempty(cfg)
-        cfg.deadband_us = 25;
+        cfg.deadband_us  = 25;
         cfg.max_accel_fwd = 2.2;
         cfg.max_accel_rev = 1.8;
-        cfg.drag_coeff = 0.35;
+        cfg.drag_k0 = 3.669;   % rolling resistance [m/s^2]  — measured coast fit
+        cfg.drag_k1 = 0.201;   % viscous drag [1/s]           — measured coast fit
     end
 
     u = (pwm_us - 1500) / 500;
@@ -31,8 +34,9 @@ function a_long = throttle_pwm_to_accel(pwm_us, v_current, cfg)
         drive_accel = -cfg.max_accel_rev * (abs(u_eff)^2);
     end
 
-    % Simple rolling/air drag term to keep the simulation realistic.
-    a_long = drive_accel - cfg.drag_coeff * v_current;
+    % Two-term drag: constant rolling resistance + speed-proportional viscous drag.
+    drag = cfg.drag_k0 + cfg.drag_k1 * abs(v_current);
+    a_long = drive_accel - sign(v_current) * drag;
 end
 
 function y = clamp(x, lo, hi)

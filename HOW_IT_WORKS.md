@@ -92,6 +92,23 @@ The two cores share data through **`heapless::spsc` lock-free queues**. The SIO 
 | `2` | `ControlReady` | Core 1 → Core 0 | A `ControlOutput` was pushed to `control_q` |
 | `3` | `LogReady` | Core 1 → Core 0 | A `LogData` was pushed to `log_q` |
 
+#### `SensorEvent` — an enum, not a struct
+
+Rather than a flat struct with a `values: [f32; 4]` array (where unused slots were `f32::INFINITY` sentinels), `SensorEvent` carries a typed `kind: SensorKind` field:
+
+| Variant | Fields | Sent by |
+| ------- | ------ | ------- |
+| `Encoder` | `steer`, `rpm_period_us` | `gpio_interrupt` on each encoder pulse |
+| `EncoderTimeout` | `steer` | `sensor_timeout` after 100 ms silence |
+| `Distances` | `left_cm`, `center_cm`, `right_cm` | `ultrasound_scan` after each 3-sensor sweep |
+| `SetpointUpdate` | `setpoint_mps` | `delay_update_setpoint` and `usb_interrupt` on change |
+
+This eliminates the sentinel pattern and lets Core 1 use exhaustive `match` instead of `if is_distance_event` checks.
+
+#### Setpoint delivery
+
+The speed setpoint is **only transmitted when it changes**, via `SensorKind::SetpointUpdate`. Previous versions piggybacked the setpoint on every encoder event. Core 1 tracks the current setpoint in a local variable (`current_setpoint_mps`) and only updates it when a `SetpointUpdate` arrives.
+
 #### Queues
 
 | Queue | Type | Depth | Producer | Consumer |

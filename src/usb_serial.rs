@@ -1,12 +1,8 @@
 //! USB serial initialization and communication.
 #![deny(unsafe_code)]
 
-use crate::constants::PWM_PERIOD;
-use crate::utils::micros_to_pwm_ticks;
+use crate::ipc::Constants;
 use defmt::{info, trace};
-use embedded_hal::pwm::SetDutyCycle as _;
-use fugit::MicrosDurationU32;
-use rp235x_hal as hal;
 use rp235x_hal::{clocks::UsbClock, pac, usb::UsbBus};
 use rtic::Mutex;
 use rtic::mutex_prelude::*;
@@ -15,12 +11,22 @@ use usb_device::{
     device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
 };
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
+
 pub type MyUsbBus = UsbBus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlMode {
     Manual,
     Auto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UsbCommand {
+    SetPwmA { on_time_us: u32 },
+    SetPwmB { on_time_us: u32 },
+    SetConstant { constant: Constants, value: f32 },
+    SendAlign { angle: f32, confidence: f32 },
+    SetControlMode { mode: ControlMode },
 }
 
 pub fn init_usb_serial(
@@ -53,12 +59,9 @@ pub fn init_usb_serial(
 pub fn process_usb_command(
     mut usb_dev: impl Mutex<T = UsbDevice<'static, MyUsbBus>>,
     mut serial: impl Mutex<T = SerialPort<'static, MyUsbBus>>,
-    mut pwm: impl Mutex<T = hal::pwm::Slice<hal::pwm::Pwm0, hal::pwm::FreeRunning>>,
     command_buffer: &mut [u8; 64],
     buffer_len: &mut usize,
-    mut speed_setpoint: impl Mutex<T = f32>,
-    mut control_mode: impl Mutex<T = ControlMode>,
-) {
+) -> Option<UsbCommand> {
     let mut bytes_read = 0;
     (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
         trace!(
@@ -82,7 +85,6 @@ pub fn process_usb_command(
             *buffer_len += count;
         }
 
-        // Echo received data back to USB if feature is enabled (skip CR/LF to avoid cursor jumping)
         #[cfg(feature = "echo_usb")]
         if bytes_read > 0 {
             for &byte in &command_buffer[*buffer_len - bytes_read..*buffer_len] {
@@ -97,12 +99,11 @@ pub fn process_usb_command(
     if *buffer_len == command_buffer.len() {
         info!("USB command too long, dropping buffer");
         *buffer_len = 0;
-        return;
+        return None;
     }
     if *buffer_len > 0
         && (command_buffer[*buffer_len - 1] == b'\n' || command_buffer[*buffer_len - 1] == b'\r')
     {
-        // Newline-terminated command framing.
         let command =
             core::str::from_utf8(&command_buffer[..*buffer_len]).unwrap_or("<invalid utf-8>");
         let command = command.trim();
@@ -111,92 +112,69 @@ pub fn process_usb_command(
 
         if let Some(rest) = command.strip_prefix("pwm-a ") {
             if let Some(on_time_us) = parse_on_time_us(rest) {
-                let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
-                let ticks = micros_to_pwm_ticks(on_time);
-                pwm.lock(|pwm| {
-                    let _ = pwm.channel_a.set_duty_cycle(ticks);
-                });
-                info!(
-                    "Set PWM A on-time to {} us ({} ticks)",
-                    on_time.ticks(),
-                    ticks
-                );
-
-                // Echo success if feature is enabled
-                #[cfg(feature = "echo_usb")]
-                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                    let _ = serial.write(b"\r\nOK\r\n");
-                    usb_dev.poll(&mut [serial]);
-                });
+                send_ok(&mut usb_dev, &mut serial);
+                return Some(UsbCommand::SetPwmA { on_time_us });
             } else {
                 info!("Invalid pwm-a value: {}", rest);
             }
-        } else if let Some(rest) = command.strip_prefix("speed ") {
-            if let Some(setpoint_mps) = parse_speed_setpoint(rest) {
-                speed_setpoint.lock(|setpoint| *setpoint = setpoint_mps);
-                info!("Set speed setpoint to {} m/s", setpoint_mps);
-
-                #[cfg(feature = "echo_usb")]
-                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                    let _ = serial.write(b"\r\nOK\r\n");
-                    usb_dev.poll(&mut [serial]);
-                });
-            } else {
-                info!("Invalid speed value: {}", rest);
-            }
         } else if let Some(rest) = command.strip_prefix("pwm-b ") {
             if let Some(on_time_us) = parse_on_time_us(rest) {
-                let on_time = MicrosDurationU32::from_ticks(on_time_us).min(PWM_PERIOD);
-                let ticks = micros_to_pwm_ticks(on_time);
-                pwm.lock(|pwm| {
-                    let _ = pwm.channel_b.set_duty_cycle(ticks);
-                });
-                info!(
-                    "Set PWM B on-time to {} us ({} ticks)",
-                    on_time.ticks(),
-                    ticks
-                );
-
-                // Echo success if feature is enabled
-                #[cfg(feature = "echo_usb")]
-                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                    let _ = serial.write(b"\r\nOK\r\n");
-                    usb_dev.poll(&mut [serial]);
-                });
+                send_ok(&mut usb_dev, &mut serial);
+                return Some(UsbCommand::SetPwmB { on_time_us });
             } else {
                 info!("Invalid pwm-b value: {}", rest);
             }
+        } else if let Some(rest) = command.strip_prefix("const ") {
+            if let Some((constant, value)) = parse_constant_update(rest) {
+                send_ok(&mut usb_dev, &mut serial);
+                return Some(UsbCommand::SetConstant { constant, value });
+            } else {
+                info!("Invalid const value: {}", rest);
+            }
+        } else if let Some(rest) = command.strip_prefix("align ") {
+            let mut parts = rest.split_ascii_whitespace();
+            let angle = parts.next().and_then(|value| value.parse::<f32>().ok());
+            let confidence = parts.next().and_then(|value| value.parse::<f32>().ok());
+            if let (Some(angle), Some(confidence), None) = (angle, confidence, parts.next()) {
+                send_ok(&mut usb_dev, &mut serial);
+                return Some(UsbCommand::SendAlign { angle, confidence });
+            } else {
+                info!("Invalid align value: {}", rest);
+            }
         } else if let Some(rest) = command.strip_prefix("mode ") {
-            if let Some(new_mode) = parse_control_mode(rest) {
-                control_mode.lock(|mode| *mode = new_mode);
-                info!("Set control mode to {:?}", defmt::Debug2Format(&new_mode));
-
-                #[cfg(feature = "echo_usb")]
-                (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                    let _ = serial.write(b"\r\nOK\r\n");
-                    usb_dev.poll(&mut [serial]);
-                });
+            if let Some(mode) = parse_control_mode(rest) {
+                send_ok(&mut usb_dev, &mut serial);
+                return Some(UsbCommand::SetControlMode { mode });
             } else {
                 info!("Invalid control mode: {}", rest);
             }
         } else {
             info!("Unknown command: {}", command);
-            #[cfg(feature = "echo_usb")]
-            (&mut usb_dev, &mut serial).lock(|usb_dev, serial| {
-                let _ = serial.write(b"\r\nERR: unknown/malformed command\r\n");
-                usb_dev.poll(&mut [serial]);
-            });
+            send_error(
+                &mut usb_dev,
+                &mut serial,
+                b"\r\nERR: unknown/malformed command\r\n",
+            );
         }
+
+        send_error(&mut usb_dev, &mut serial, b"\r\nERR: malformed command\r\n");
     }
+
+    None
 }
 
-// Parse USB command argument as microseconds. Returns None if not a valid number.
 fn parse_on_time_us(arg: &str) -> Option<u32> {
     arg.trim().parse::<u32>().ok()
 }
 
-fn parse_speed_setpoint(arg: &str) -> Option<f32> {
-    arg.trim().parse::<f32>().ok()
+fn parse_constant_update(arg: &str) -> Option<(Constants, f32)> {
+    let mut parts = arg.split_ascii_whitespace();
+    let constant = Constants::try_from(parts.next()?).ok()?;
+    let value = parts.next()?.parse::<f32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((constant, value))
 }
 
 fn parse_control_mode(arg: &str) -> Option<ControlMode> {
@@ -205,4 +183,27 @@ fn parse_control_mode(arg: &str) -> Option<ControlMode> {
         "auto" => Some(ControlMode::Auto),
         _ => None,
     }
+}
+
+fn send_ok(
+    usb_dev: &mut impl Mutex<T = UsbDevice<'static, MyUsbBus>>,
+    serial: &mut impl Mutex<T = SerialPort<'static, MyUsbBus>>,
+) {
+    #[cfg(feature = "echo_usb")]
+    (usb_dev, serial).lock(|usb_dev, serial| {
+        let _ = serial.write(b"\r\nOK\r\n");
+        usb_dev.poll(&mut [serial]);
+    });
+}
+
+fn send_error(
+    usb_dev: &mut impl Mutex<T = UsbDevice<'static, MyUsbBus>>,
+    serial: &mut impl Mutex<T = SerialPort<'static, MyUsbBus>>,
+    response: &[u8],
+) {
+    #[cfg(feature = "echo_usb")]
+    (usb_dev, serial).lock(|usb_dev, serial| {
+        let _ = serial.write(response);
+        usb_dev.poll(&mut [serial]);
+    });
 }

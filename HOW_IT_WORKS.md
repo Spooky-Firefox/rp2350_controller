@@ -4,12 +4,13 @@
 
 This program runs on an **RP2350 microcontroller** (the chip on a Raspberry Pi Pico 2 board). Unlike a regular computer, a microcontroller has no operating system — our program *is* the only thing running. It starts at power-on and runs forever.
 
-The program does four things:
+The program does five things:
 
 1. **Controls two servo/motor outputs** via PWM signals (GPIO 16 and 17)
-2. **Measures rotation speed** from a Hall-effect encoder (GPIO 13)
-3. **Runs a Kalman-filtered speed controller** on a dedicated second CPU core
-4. **Receives commands** from a PC over USB serial
+2. **Measures rotation speed** from a Hall-effect encoder (GPIO 18)
+3. **Runs a Kalman-filtered speed controller + wall-following steering** on a dedicated second CPU core
+4. **Polls three HC-SR04 ultrasonic sensors** for wall distance and sends readings to Core 1
+5. **Receives commands** from a PC over USB serial
 
 ---
 
@@ -25,10 +26,9 @@ Priority 4           │  sio_interrupt    — control output from Core 1
 Priority 3           │  gpio_interrupt   — encoder edge detected
 Priority 2           │  sensor_timeout   — no encoder pulse for 100 ms
 Priority 1           │  toggle_led       — periodic heartbeat
-                     │  delay_update_setpoint — defer setpoint updates
                      │  log_data         — send logging data to host
                      │  periodic_drain_log_data — trigger log buffer drain
-                     │  ultrasound_scan  — poll 3 HC-SR04 sensors in sequence
+                     │  ultrasound_scan  — poll 3 HC-SR04 sensors, send Distances event to Core 1
 Priority 0 (lowest)  │  idle             — runs when nothing else does
 ```
 
@@ -38,15 +38,14 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | ------ | ------- | ------------ |
 | `init` | Power-on, once | Sets up all hardware, spawns Core 1 |
 | `idle` | Always (background) | Sleeps (WFE) when nothing is scheduled |
-| `toggle_led` | Every 1 second | Blinks the onboard LED — visual "heartbeat" |
-| `gpio_interrupt` | Rising edge on GPIO 13 | Measures encoder period, pushes `SensorEvent` to `sensor_q`, signals Core 1 |
-| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes a timeout `SensorEvent` to `sensor_q` so the filter can coast |
-| `delay_update_setpoint` | Periodic delay (50 ms) | Defers speed setpoint updates to avoid excessive Core 1 wakeups |
+| `toggle_led` | Every 250 ms | Blinks the onboard LED — visual "heartbeat" |
+| `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent::Encoder` to `sensor_q`, signals Core 1 |
+| `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes `SensorEvent::EncoderTimeout` so the filter can coast |
 | `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
-| `usb_interrupt` | USB data received | Reads commands and adjusts speed setpoint or PWM |
+| `usb_interrupt` | USB data received | Parses USB commands; applies PWM commands locally; forwards `ConstantUpdate` and `CameraAlign` events to Core 1 |
 | `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
-| `periodic_drain_log_data` | Every 50 ms | Signals `log_data` to drain the logging buffer and transmit |
-| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo interrupt, RTT-logs µs + cm |
+| `periodic_drain_log_data` | Every 100 ms | Signals `log_data` to drain the logging buffer and transmit |
+| `ultrasound_scan` | Continuous (60 ms between sensors) | Fires HC-SR04 trigger, awaits echo, collects all 3 distances, sends `SensorEvent::Distances` to Core 1 |
 
 ---
 
@@ -61,9 +60,9 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
  │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
  │  - encoder ISR           │ Events  │  - Kalman filter         │
  │  - USB serial            │         │  - PID speed controller  │
- │  - PWM output            │ <────── │                          │
+ │  - PWM output            │ <────── │  - Wall-following PID    │
  │  - sensor timeout        │ Control │                          │
- │                          │ Events  │                          │
+ │  - ultrasound scan       │ Events  │                          │
  └──────────────────────────┘         └──────────────────────────┘
 ```
 
@@ -92,11 +91,41 @@ The two cores share data through **`heapless::spsc` lock-free queues**. The SIO 
 | `2` | `ControlReady` | Core 1 → Core 0 | A `ControlOutput` was pushed to `control_q` |
 | `3` | `LogReady` | Core 1 → Core 0 | A `LogData` was pushed to `log_q` |
 
+#### `SensorEvent` — an enum, not a struct
+
+Rather than a flat struct with a `values: [f32; 4]` array (where unused slots were `f32::INFINITY` sentinels), `SensorEvent` carries a typed `kind: SensorKind` field:
+
+| Variant | Fields | Sent by |
+| ------- | ------ | ------- |
+| `Encoder` | `steer`, `rpm_period_us` | `gpio_interrupt` on each encoder pulse |
+| `EncoderTimeout` | `steer` | `sensor_timeout` after 100 ms silence |
+| `Distances` | `left_cm`, `center_cm`, `right_cm` | `ultrasound_scan` after each 3-sensor sweep |
+| `ConstantUpdate` | `constant`, `value` | `usb_interrupt` for runtime tuning commands |
+| `CameraAlign` | `angle`, `confidence` | `usb_interrupt` for raw camera alignment input |
+
+This eliminates the sentinel pattern and lets Core 1 use exhaustive `match` instead of `if is_distance_event` checks.
+
+#### Runtime constant delivery
+
+Runtime tuning commands are forwarded as `SensorKind::ConstantUpdate { constant, value }`. The `constant` field is a compact `#[repr(u8)]` enum (`Constants`) instead of a string, so command identifiers are cheap to carry on an embedded target.
+
+Core 1 owns the actual controller state. When a `ConstantUpdate` arrives, Core 1 updates the relevant controller field locally:
+
+- `SpeedSetpoint` updates the straight-line controller target
+- `SpeedKp`, `SpeedKi`, `SpeedKd` tune the speed PID
+- `SteeringKp`, `SteeringKi`, `SteeringKd` tune the wall-following PID
+
+Core 0 does not cache or deduplicate these values anymore; it only parses the USB command and forwards the event.
+
+#### Camera alignment delivery
+
+The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. This is treated as a raw camera observation, not a final fused heading estimate. Core 1 receives it so the value can later be combined with the EKF instead of being trusted directly.
+
 #### Queues
 
 | Queue | Type | Depth | Producer | Consumer |
 | ----- | ---- | ----- | -------- | -------- |
-| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`) | Core 1 |
+| `sensor_q` | `SensorEvent` | 4 | Core 0 (`gpio_interrupt`, `sensor_timeout`, `ultrasound_scan`, `usb_interrupt`) | Core 1 |
 | `control_q` | `ControlOutput` | 4 | Core 1 | Core 0 (`sio_interrupt`) |
 | `log_q` | `LogData` | 128 | Core 1 | Core 0 (`log_data`) |
 
@@ -293,32 +322,39 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 | Command | Example | Effect |
 | ------- | ------- | ------ |
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
-| `speed <m/s>` | `speed 1.2` | Set the speed controller target to 1.2 m/s |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
+| `const <constant> <value>` | `const speed 1.2` | Set speed controller target to 1.2 m/s (or tune PID constants) |
+| `align <angle> <confidence>` | `align 45.5 0.95` | Send raw camera alignment (angle in degrees, confidence 0-1) |
+
+The `const` command accepts these constant names:
+- `speed`, `setpoint`, `speed_setpoint` — target speed in m/s
+- `speed_kp`, `speed_ki`, `speed_kd` — speed controller PID gains
+- `steering_kp`, `steering_ki`, `steering_kd` — wall-following controller PID gains
 
 Commands must end with a newline (`\n`). PWM values are capped at the 20 000 µs frame period, and the controller itself later clamps output to the usual servo range of roughly 1000-2000 µs.
 
-`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `speed` updates a shared setpoint that is attached to every `SensorEvent` sent to Core 1.
+`pwm-a` and `pwm-b` directly override the current PWM compare value on Core 0. `const` updates send a `ConstantUpdate` sensor event to Core 1, which applies the change to its controller state. `align` sends a `CameraAlign` event for EKF fusion.
 
 ---
 
 ## Shared Data and Why Locking Matters
 
-Some data is **shared** between RTIC tasks. In the current code, examples include:
+Some data is **shared** between RTIC tasks on Core 0. In the current code, examples include:
 
-- `speed_setpoint_mps`: written by `usb_interrupt`, read by `gpio_interrupt` and `sensor_timeout`
 - `last_sensor_irq_us`: written by `gpio_interrupt`, read by `sensor_timeout`
-- `fifo`: used by both the sensor-producing tasks and the SIO receive task
-- `pwm`: updated by both USB commands and control messages from Core 1
+- `fifo_tx` and `fifo_rx`: used by sensor-producing tasks and the SIO receive task to communicate with Core 1
+- `pwm`: updated by USB commands (`usb_interrupt`) and control messages from Core 1 (`sio_interrupt`)
 
 Because a higher-priority task can interrupt a lower-priority one mid-read or mid-write, shared state must be protected.
 
+Note: **`speed_setpoint_mps` is no longer shared.** It was moved to Core 1's local state after the refactor; Core 0 forwards all setpoint changes as `ConstantUpdate` sensor events instead of caching them.
+
 > **Race condition (brief):** If task A is halfway through writing a value and task B reads it, B gets garbage. This is a race condition — the result depends on timing, which is unpredictable.
 
-RTIC prevents this by requiring a **lock** whenever shared data is accessed. While a task holds the lock, no other task can interrupt and touch the same resource. You'll see this in code as:
+RTIC prevents this by requiring a **lock** whenever shared data is accessed. While a task holds the lock, no other task can interrupt and touch the same resource. For example:
 
 ```rust
-ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
+ctx.shared.pwm.lock(|pwm| pwm.set_duty_cycle(new_duty));
 ```
 
 The compiler *enforces* that you lock before accessing — you cannot forget, unlike in most other languages.
@@ -449,10 +485,10 @@ In Python this would be `def add(a, b): return a + b`. The last expression in a 
 Closures are the `|variable| expression` syntax you'll see throughout the code:
 
 ```rust
-ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
+ctx.shared.control_mode.lock(|mode| *mode = ControlMode::Auto);
 ```
 
-The `|setpoint|` part is like Python's `lambda setpoint:` — it defines an anonymous function that receives `setpoint` as an argument. This particular line means: *"acquire the lock, then run this small function with the protected value"*.
+The `|mode|` part is like Python's `lambda mode:` - it defines an anonymous function that receives `mode` as an argument. This particular line means: *"acquire the lock, then run this small function with the protected value"*.
 
 Another example with a longer body:
 
@@ -495,11 +531,11 @@ let clocks = init_clocks_and_plls(...).unwrap();
 The `&` prefix means "a reference to" (a pointer, not a copy). The `*` prefix means "follow the reference to get the actual value":
 
 ```rust
-ctx.shared.speed_setpoint_mps.lock(|setpoint| *setpoint = new_value);
-//                                               ^ write through the reference
+ctx.shared.control_mode.lock(|mode| *mode = ControlMode::Auto);
+//                                     ^ write through the reference
 ```
 
-Think of `setpoint` as a pointer in C, or a MATLAB `handle` object — `*setpoint` reaches the value it points to.
+Think of `mode` as a pointer in C, or a MATLAB `handle` object - `*mode` reaches the value it points to.
 
 ### Macros — the `!` suffix
 

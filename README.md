@@ -98,8 +98,12 @@ Commands are newline-terminated ASCII strings received over the USB CDC serial p
 | `pwm-b <microseconds>` | `pwm-b 1500` | Set PWM channel B directly |
 | `speed <m/s>` | `speed 0.40` | Update the Core 1 speed setpoint |
 | `const steering_kp <value>` | `const steering_kp 50` | Update the Core 1 steering PID gain |
-| `mode manual` | `mode manual` | Keep direct host PWM commands active |
-| `mode auto` | `mode auto` | Allow Core 0 to apply control outputs from Core 1 |
+| `mode manual` | `mode manual` | Keep both steering and throttle in manual mode |
+| `mode auto` | `mode auto` | Put both steering and throttle in auto mode |
+| `mode steering manual` | `mode steering manual` | Keep steering manual while leaving throttle unchanged |
+| `mode steering auto` | `mode steering auto` | Put steering under Core 1 control only |
+| `mode throttle manual` | `mode throttle manual` | Keep throttle manual while leaving steering unchanged |
+| `mode throttle auto` | `mode throttle auto` | Put throttle under Core 1 control only |
 
 The `align <angle> <confidence>` command is also forwarded to Core 1 and updates the latest camera-derived steering angle used by the steering PID.
 

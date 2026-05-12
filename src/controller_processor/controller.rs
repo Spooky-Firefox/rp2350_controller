@@ -116,10 +116,10 @@ pub struct SteeringAngleController {
 }
 
 impl SteeringAngleController {
-    /// Update steering using the provided PID step size.
-    pub fn update(&mut self, measured_angle_deg: f32, step: f32) -> u16 {
+    /// Update steering using traveled distance as PID step size.
+    pub fn update(&mut self, measured_angle_deg: f32, distance_increment_m: f32) -> u16 {
         let error = self.angle_setpoint_deg - measured_angle_deg;
-        let steering_output = self.pid.update(error, step);
+        let steering_output = self.pid.update(error, distance_increment_m);
 
         (self.neutral_steering_pwm_us as f32 - steering_output).clamp(
             self.min_steering_pwm_us as f32,

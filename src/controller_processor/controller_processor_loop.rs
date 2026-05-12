@@ -9,11 +9,13 @@ use defmt::info;
 use fugit::TimerInstantU64;
 use heapless::spsc::{Consumer, Producer};
 use rp235x_hal as hal;
+use core::f32::consts::PI;
 
 type Instant = TimerInstantU64<1_000_000>;
 
 const NEUTRAL_PWM_US: u16 = 1500;
 const STARTUP_DURATION_US: u64 = 5_000_000;
+const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 600.0;
 
 // Straight driving mode outputs.
 const STRAIGHT_THROTTLE_PWM_US: u16 = 1600;
@@ -255,8 +257,6 @@ pub fn core1_task(
     };
 
     let mut time_ext = TimeExtender::new();
-    let mut last_step_time_us: Option<u64> = None;
-
     loop {
         let word = fifo.read_blocking();
         if !matches!(IpcSignal::from_u32(word), Some(IpcSignal::SensorReady)) {
@@ -269,11 +269,6 @@ pub fn core1_task(
 
         let t_us = time_ext.extend(event.t32_us);
         let now = Instant::from_ticks(t_us);
-        let dt_s = last_step_time_us
-            .map(|last| t_us.saturating_sub(last) as f32 * 1e-6)
-            .unwrap_or(0.0);
-        last_step_time_us = Some(t_us);
-
         if state.startup_until_us.is_none() {
             state.startup_until_us = Some(t_us.saturating_add(STARTUP_DURATION_US));
         }
@@ -284,7 +279,7 @@ pub fn core1_task(
             fifo: &mut fifo,
         };
 
-        handle_sensor_event(&mut state, event.kind, now, t_us, dt_s, &mut io);
+        handle_sensor_event(&mut state, event.kind, now, t_us, &mut io);
     }
 }
 
@@ -293,7 +288,6 @@ fn handle_sensor_event(
     event: SensorKind,
     now: Instant,
     t_us: u64,
-    dt_s: f32,
     io: &mut Core1Io<'_>,
 ) {
     info!(
@@ -301,6 +295,8 @@ fn handle_sensor_event(
         t_us,
         defmt::Debug2Format(&event)
     );
+
+    let mut distance_increment_m = 0.0;
 
     match event {
         SensorKind::ConstantUpdate { constant, value } => {
@@ -347,6 +343,7 @@ fn handle_sensor_event(
         }
         SensorKind::Encoder { rpm_period_us } => {
             info!("Encoder value: rpm_period_us={}", rpm_period_us);
+            distance_increment_m = LENGTH_PER_HAL_RISE_METERS;
         }
         SensorKind::EncoderTimeout => {
             info!("Encoder timeout event");
@@ -370,7 +367,9 @@ fn handle_sensor_event(
         DriveMode::Startup => (NEUTRAL_PWM_US, NEUTRAL_PWM_US),
         DriveMode::Straight => {
             let measured_angle_deg = state.active_angle_deg();
-            let steer_pwm_us = state.steering_controller.update(measured_angle_deg, dt_s);
+            let steer_pwm_us = state
+                .steering_controller
+                .update(measured_angle_deg, distance_increment_m);
             (steer_pwm_us, STRAIGHT_THROTTLE_PWM_US)
         }
         DriveMode::Turning { direction, .. } => {

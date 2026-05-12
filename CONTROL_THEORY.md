@@ -1,296 +1,204 @@
 # Control Theory Notes
 
-This note explains what the control-side code is doing in plain engineering terms. It is about the logic in:
+This note explains what the control-side code is doing in plain engineering terms.
+Relevant source files:
 
-- `src/controller_processor/kalman_filter.rs`
-- `src/controller_processor/controller.rs`
-- `src/controller_processor/controller_processor_loop.rs`
+- `src/controller_processor/controller.rs` — PID and RLS filter structs
+- `src/controller_processor/controller_processor_loop.rs` — Core 1 event loop and drive-mode logic
 
 ## Big Picture
 
 Core 1 does two jobs:
 
-1. Estimate the vehicle state from incomplete sensor data.
-2. Turn that estimate into actuator commands.
+1. **Estimate** the camera-derived steering angle (via RLS filtering).
+2. **Turn that estimate into actuator commands** according to the current drive mode.
 
-In this project, the state estimator is an **Extended Kalman Filter (EKF)**, the speed actuator logic is a **PID speed controller**, and steering is handled by a separate **wall-following PID controller** that uses three HC-SR04 distance sensors.
+There is no Kalman filter. Throttle is open-loop (fixed PWM), and steering is closed-loop on camera angle.
 
 The data flow is:
 
 ```text
-SensorEvent::Encoder / EncoderTimeout
+SensorEvent::CameraAlign { angle, confidence }
             |
             v
-   time extension + parsing
+  RlsAngleFilter.update(angle) → filtered_angle_deg
             |
             v
-   EKF predict/update cycle
-            |
-            v
- estimated speed v_hat
-            |
-            v
-  PID speed controller → power PWM
+  SteeringAngleController.update(filtered_angle, distance_increment)
+            → steer_pwm_us
 
-SensorEvent::Distances (left, center, right)
+SensorEvent::Encoder { rpm_period_us }
             |
             v
-  Wall-following PID → steering PWM
+  distance_increment_m = LENGTH_PER_HAL_RISE_METERS
+  (used as the PID step size for the steering controller above)
 
-SensorEvent::SetpointUpdate
+SensorEvent::Distances { left_cm, center_cm, right_cm }
             |
             v
-  controller.set_speed_setpoint()
+  Turn-trigger detection
+  → may switch DriveMode to Turning { direction }
+
+SensorEvent::EncoderTimeout
+  → distance_increment_m = 0.0 (steering PID does not step)
 ```
 
-## Why Use a Kalman Filter Here?
+---
 
-The encoder does not directly measure the full vehicle state. It gives only intermittent speed-related information: the time between Hall sensor edges.
+## Drive Modes
 
-That means the controller has problems if it uses raw measurements directly:
+Core 1 maintains a `DriveMode` state machine with three states:
 
-- measurements arrive only when a magnet passes the sensor
-- long gaps mean there is temporarily no new measurement
-- noise in pulse timing becomes noise in the inferred speed
-- future extensions may want position and heading, not just speed
+```text
+   STARTUP  ──5 s──►  STRAIGHT  ──turn trigger──►  TURNING
+                         ▲                              │
+                         └──── angle flip ◄─────────────┘
+```
 
-The EKF provides a consistent state estimate even when measurements are sparse. Between measurements, it predicts forward using a vehicle model. When a new speed sample arrives, it corrects that prediction.
+### STARTUP
 
-## State Vector
+Outputs neutral PWM (1500 µs) for both steering and throttle for the first 5 seconds after boot.
+This gives the vehicle time to settle on the ground before the controller takes over.
 
-The filter state is:
+### STRAIGHT
 
-$$x = [X, Y, \theta, v]$$
+- **Throttle**: fixed at 1600 µs.
+- **Steering**: driven by `SteeringAngleController` using the latest RLS-filtered camera angle.
 
-where:
+### TURNING (currently disabled via `ENABLE_TURNING_MODE = false`)
 
-- $X, Y$ are planar position in meters
-- $\theta$ is heading in radians
-- $v$ is longitudinal speed in meters per second
+Fixed open-loop PWM values are applied:
+- Throttle: 1600 µs
+- Steering left: 1325 µs / Steering right: 1675 µs
 
-Even though the current controller mainly uses $v$, the filter is structured as a small vehicle model rather than a one-variable smoother.
+Turn entry is triggered when an HC-SR04 left or right sensor shows a large distance jump (≥ 100 cm) or
+returns no-value readings for 3 consecutive sweeps — indicating the vehicle has passed the end of a wall.
 
-## Motion Model
+Turn exit is triggered when the camera angle flips sign beyond ±30° from the sign at turn entry — indicating
+the vehicle has completed the corner.
 
-The prediction step uses a **kinematic bicycle model**. This is a standard simplified car model where the front wheels are collapsed into one steerable wheel and the rear wheels into one fixed wheel.
+---
 
-The continuous-time equations are:
+## RLS Angle Filter
 
-$$\dot X = v \cos(\theta)$$
-$$\dot Y = v \sin(\theta)$$
-$$\dot \theta = \frac{v}{L}\tan(\delta)$$
-$$\dot v = a_{long}$$
+The camera angle arriving over USB can be noisy. The **Recursive Least Squares (RLS)** filter smooths it
+adaptively while still tracking genuine changes.
 
-where:
+The scalar update equations are:
 
-- $L$ is wheelbase
-- $\delta$ is steering angle
-- $a_{long}$ is longitudinal acceleration input
+$$K_n = \frac{P_{n-1}}{\lambda + P_{n-1}}$$
 
-The implementation advances these equations over a small sample interval $dt$ to get the next predicted state.
+$$\hat{\theta}_n = \hat{\theta}_{n-1} + K_n\,(z_n - \hat{\theta}_{n-1})$$
 
-## Why It Is an Extended Kalman Filter
-
-A plain Kalman filter assumes everything is linear. This vehicle model is not linear because of terms like:
-
-- $\cos(\theta)$
-- $\sin(\theta)$
-- $\tan(\delta)$
-- the speed measurement model using $|v|$
-
-So the code linearizes the nonlinear model around the current operating point using Jacobians. That is what makes it an **extended** Kalman filter.
-
-## Predict Step
-
-On every event, the filter first computes:
-
-$$dt = t_{now} - t_{last}$$
-
-and clamps it to a maximum configured value so that a long silence does not explode covariance.
-
-Then it performs two related updates:
-
-1. **State prediction** using the vehicle equations.
-2. **Covariance prediction** using the linearized Jacobian $F$ and process noise $Q$.
-
-Conceptually:
-
-$$x^-_{k+1} = f(x_k, u_k, dt)$$
-$$P^-_{k+1} = F P_k F^T + Q$$
-
-Here:
-
-- $x$ is the state estimate
-- $P$ is the covariance matrix
-- $u = [\delta, a_{long}]$ is the control input
-- $Q$ is process noise, representing model uncertainty
-
-The process noise terms in `EkfConst` let you say how much you trust the model between measurements.
-
-## Measurement Step
-
-When a Hall sensor period arrives, Core 1 converts that period to linear speed:
-
-$$v_{meas} = \frac{d_{pulse}}{t_{pulse}}$$
-
-where $d_{pulse}$ is the arc length per encoder pulse.
-
-The EKF then updates only the speed-related part of the state. The measurement model is:
-
-$$z = |v| + noise$$
-
-The absolute value is used because the encoder period gives speed magnitude, not signed direction.
-
-The code smooths this a bit near zero using:
-
-$$|v| \approx \sqrt{v^2 + \epsilon^2}$$
-
-This avoids a derivative singularity at $v = 0$.
-
-Then the usual Kalman logic happens:
-
-$$y = z - h(x)$$
-$$S = H P H^T + R$$
-$$K = P H^T S^{-1}$$
-$$x \leftarrow x + Ky$$
+$$P_n = \frac{P_{n-1} - K_n P_{n-1}}{\lambda}$$
 
 where:
 
-- $y$ is innovation or residual
-- $H$ is the measurement Jacobian
-- $R$ is measurement noise variance
-- $K$ is Kalman gain
+- $z_n$ is the raw measured angle
+- $\hat{\theta}_n$ is the filtered angle estimate
+- $P_n$ is the estimate covariance (confidence)
+- $K_n$ is the adaptive gain (Kalman-style)
+- $\lambda \in (0,1]$ is the **forgetting factor**
 
-Intuition:
+Tuning knobs (set in `controller_processor_loop.rs`):
 
-- if the model is uncertain, the filter trusts the measurement more
-- if the measurement is noisy, the filter trusts the model more
+| Parameter | Value | Effect |
+| --------- | ----- | ------ |
+| `lambda` | 0.98 | Close to 1 → stable, slow to adapt; lower → faster but noisier |
+| `measurement_noise_variance` | 0.5 | Higher → trust model more, smoother output |
 
-## Timeout Handling
+When $\lambda = 1$ the filter is equivalent to a simple running average with no forgetting.
+The current value of 0.98 means measurements older than ~50 samples contribute negligibly.
 
-Not every event contains a fresh encoder speed sample. The timeout task on Core 0 sends a `SensorEvent` with no RPM period when no pulse has arrived for 100 ms.
+---
 
-That causes Core 1 to call `on_timeout()`, which performs only the predict step.
+## Steering Angle PID
 
-This matters because otherwise the filter would freeze time whenever the encoder is quiet. Instead, the estimate continues to evolve and the covariance grows to reflect reduced certainty.
+`SteeringAngleController` runs a standard PID on camera-angle error:
 
-## Timestamp Extension
+$$e = \theta_{setpoint} - \theta_{filtered}$$
 
-The inter-core message packs only the lower 32 bits of the microsecond timestamp. That wraps roughly every 71.6 minutes. `TimeExtender` reconstructs a monotonic 64-bit timeline on Core 1 so the filter can still compute correct $dt$ values across wraparound.
+$$u_{steer} = u_{neutral} - \left( K_p\,e + K_i \int e\,ds + K_d \frac{de}{ds} \right)$$
 
-## Controller
+Note the **integral and derivative step** is the **encoder distance increment** $ds$
+(`LENGTH_PER_HAL_RISE_METERS = 13\pi/600` m per Hall rise), not wall-clock time.
+This means the PID only integrates while the vehicle is moving.
 
-After the EKF updates, the controller uses the estimated speed `filt.speed()` rather than the raw measurement.
+Output is clamped to [1250, 1750] µs.
 
-The error is:
+| Parameter | Default value | Effect |
+| --------- | ------------- | ------ |
+| `kp` | 50.0 | Immediate response to angle error |
+| `ki` | 0.0 | Steady-state bias correction (currently off) |
+| `kd` | 5.0 | Damping — resists fast angle changes |
+| `integral_limit` | 100.0 | Anti-windup clamp |
+| `angle_setpoint_deg` | 0.0 | Target: drive straight ahead |
+| `neutral_steering_pwm_us` | 1500 | Center position |
 
-$$e = v_{setpoint} - v_{estimated}$$
+### Tuning Guidance
 
-The control output is a standard PID-style form:
+- Too much `kp` → steering oscillates left/right at high frequency.
+- Too much `kd` → amplifies noise in the camera angle; feels twitchy.
+- `ki` is currently 0 because the RLS filter already removes slow drift; re-enable if persistent
+  steady-state offset is observed.
+- Increase `lambda` toward 1.0 for smoother angle tracking on a clean surface; decrease toward 0.95
+  for faster adaptation when the camera angle source is high-latency.
 
-$$u = u_{neutral} + K_p e + K_i \int e\,dt + K_d \frac{de}{dt}$$
+---
 
-In the implementation:
+## Control Modes (Manual / Auto)
 
-- `kp`, `ki`, `kd` are gains
-- `integral_error` stores the accumulated integral term
-- `previous_error` supports the derivative term
-- `integral_limit` clamps integral growth to reduce windup
-- output is clamped to servo PWM bounds
+Core 0 holds a `ControlModes` struct with **independent** flags for steering and throttle:
 
-The controller returns two values:
+```rust
+pub struct ControlModes {
+    pub steering: ControlMode,  // Manual or Auto
+    pub throttle: ControlMode,  // Manual or Auto
+}
+```
 
-- steering PWM in microseconds (overridden by the wall-following controller)
-- power PWM in microseconds
+When a `ControlOutput` arrives from Core 1 via the SIO FIFO:
 
-## Wall-Following Steering Controller
+- If `steering == Auto`, Core 0 applies `steer_pwm_us` to PWM channel A (GPIO 16).
+- If `throttle == Auto`, Core 0 applies `power_pwm_us` to PWM channel B (GPIO 17).
+- If a channel is `Manual`, the channel is **not overwritten** — it retains whatever was set
+  by the most recent `pwm-a` / `pwm-b` USB command.
 
-Steering is handled by a separate `SteeringDistanceController` that runs independently of the EKF speed loop. It receives `SensorKind::Distances` events from Core 0, which carry left, center, and right HC-SR04 readings in centimetres.
+This lets you, for example, test the steering PID at a fixed throttle:
 
-### Activation
+```
+mode throttle manual   ← freeze throttle
+pwm-b 1600             ← set throttle manually
+mode steering auto     ← let Core 1 control steering
+```
 
-The controller is only active when the center sensor reads **above** `min_distance_cm` (default 30 cm), meaning the path ahead is clear. If something is close in front, the output is `neutral_steering_pwm_us` (1500 µs) and the wall-following PID is suspended — this avoids fighting an obstacle with steering corrections.
+---
 
-### Error definition
+## Why No Kalman Filter?
 
-The error is the difference between the right and left distances:
+An Extended Kalman Filter (EKF) was present in earlier revisions for speed estimation and heading tracking.
+It was removed because:
 
-$$e = d_{right} - d_{left}$$
+1. Throttle is now open-loop — there is no speed setpoint to track via EKF.
+2. Camera angle from the `align` command already provides heading directly; dead reckoning is not needed.
+3. The RLS scalar filter is simpler to tune and sufficient for the current noise level.
 
-- $e > 0$ means the right wall is farther away → steer right to center
-- $e < 0$ means the left wall is farther away → steer left to center
+The EKF infrastructure may be reintroduced if absolute position tracking or speed-closed-loop control
+becomes a requirement.
 
-If one sensor times out (returns `f32::INFINITY`), a fixed fallback error of ±50 cm is used to steer away from the working sensor's side.
-
-### Control law
-
-Standard PID, same form as the speed controller:
-
-$$u_{steer} = u_{neutral} + K_p e + K_i \int e\,dt + K_d \frac{de}{dt}$$
-
-Output is clamped to the 1200–1800 µs servo range.
-
-### Interaction with the speed loop
-
-The `SteeringDistanceController` and `StraightLineSpeedController` run on separate event paths in Core 1:
-
-- `Distances` events update `last_distance_pwm_us`
-- `Encoder` / `EncoderTimeout` events run the EKF + speed PID and then read `last_distance_pwm_us` for the final steer output
-
-This means steering updates arrive at ~5 Hz (three 60 ms sensor gaps) while speed control runs at encoder frequency. The two loops are loosely coupled and do not block each other.
-
-## Why Estimate First, Then Control?
-
-This split is usually cleaner than feeding raw sensor values straight into the controller.
-
-Benefits:
-
-- controller sees a smoother, more consistent speed estimate
-- control logic is decoupled from raw sensor timing details
-- more sensors can be fused later without rewriting the controller
-- state variables like heading and position become available for future path tracking
-
-## Tuning Knobs
-
-Important tuning values live in `EkfConst` and `StraightLineSpeedController`.
-
-For the EKF:
-
-- `q_pos`, `q_theta`, `q_v`: process noise terms
-- `r_speed`: speed measurement noise
-- `eps_v`: smoothing around zero speed
-- `dt_max_us`: maximum trusted timestep
-
-For the controller:
-
-- `kp`: immediate response to error
-- `ki`: removes steady-state bias
-- `kd`: damps fast changes
-- `integral_limit`: anti-windup clamp
-
-Practical effect:
-
-- too much `kp` can make throttle oscillate
-- too much `ki` can cause slow overshoot and windup
-- too much `kd` can amplify estimate noise
-- too little `r_speed` makes the EKF chase noisy measurements
-- too much `r_speed` makes the EKF sluggish
-
-## Current Limitations
-
-The current code is intentionally simple and has a few placeholders:
-
-- steering is currently stubbed to `0.0` in the sensor events
-- longitudinal acceleration input is set to `0.0`
-- only speed is directly measured
-- the model is dead reckoning only; there is no absolute position sensor
-
-So this is better understood as a clean foundation for controls work, not a finished full-state autonomous vehicle stack.
+---
 
 ## Reading the Code
 
-If you want to inspect the implementation with this note open:
+Start in `controller_processor_loop.rs`:
 
-- start in `controller_processor_loop.rs` for the runtime flow
-- move to `kalman_filter.rs` for the estimator math
-- then read `controller.rs` for the PID output logic
+- `core1_task()` — entry point, initialises state, runs the blocking read loop
+- `handle_sensor_event()` — dispatches per-event state updates, drives mode transitions, calls `emit_control_output`
+- `Core1State::maybe_enter_turning_mode()` — turn-trigger logic using HC-SR04 left/right readings
+- `Core1State::maybe_exit_turning_mode()` — turn-exit logic using camera angle flip
+
+Then look in `controller.rs`:
+
+- `SteeringAngleController` — PID wrapper with clamped output
+- `RlsAngleFilter` — scalar RLS estimator
+- `Pid` — general PID building block

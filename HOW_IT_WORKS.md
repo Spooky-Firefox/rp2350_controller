@@ -41,7 +41,7 @@ Priority 0 (lowest)  │  idle             — runs when nothing else does
 | `toggle_led` | Every 250 ms | Blinks the onboard LED — visual "heartbeat" |
 | `gpio_interrupt` | Rising edge on GPIO 18 | Measures encoder period, pushes `SensorEvent::Encoder` to `sensor_q`, signals Core 1 |
 | `sensor_timeout` | Every 100 ms (if no encoder pulse) | Pushes `SensorEvent::EncoderTimeout` so the filter can coast |
-| `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies PWM; on `LogReady` spawns `log_data` |
+| `sio_interrupt` | Core 1 writes to FIFO | Reads `IpcSignal`; on `ControlReady` pops `ControlOutput` and applies steering/throttle PWM independently based on per-axis `ControlModes`; on `LogReady` spawns `log_data` |
 | `usb_interrupt` | USB data received | Parses USB commands; applies PWM commands locally; forwards `ConstantUpdate` and `CameraAlign` events to Core 1 |
 | `log_data` | Event from `periodic_drain_log_data` | Drains buffered telemetry data and sends to USB in serial plotter format |
 | `periodic_drain_log_data` | Every 100 ms | Signals `log_data` to drain the logging buffer and transmit |
@@ -58,15 +58,15 @@ The RP2350 has **two ARM Cortex-M33 cores**. This program uses both:
  │         Core 0           │  FIFO   │         Core 1           │
  │                          │ ──────> │                          │
  │  RTIC tasks:             │ Sensor  │  Blocking event loop:    │
- │  - encoder ISR           │ Events  │  - Kalman filter         │
- │  - USB serial            │         │  - PID speed controller  │
-│  - PWM output            │ <────── │  - Camera-angle steering PID │
+ │  - encoder ISR           │ Events  │  - RLS angle filter      │
+ │  - USB serial            │         │  - Drive-mode state machine │
+ │  - PWM output            │ <────── │  - Camera-angle steering PID │
  │  - sensor timeout        │ Control │                          │
  │  - ultrasound scan       │ Events  │                          │
  └──────────────────────────┘         └──────────────────────────┘
 ```
 
-**Core 0** handles all I/O — interrupts, USB, PWM. **Core 1** runs the computationally heavier control loop (EKF + PID). They communicate through the SIO hardware FIFO.
+**Core 0** handles all I/O — interrupts, USB, PWM. **Core 1** runs the control loop (RLS angle filter + steering PID + drive-mode state machine). They communicate through the SIO hardware FIFO.
 
 ### Inter-Core Communication (IPC)
 
@@ -111,34 +111,38 @@ Runtime tuning commands are forwarded as `SensorKind::ConstantUpdate { constant,
 
 Core 1 owns the actual controller state. When a `ConstantUpdate` arrives, Core 1 updates the relevant controller field locally:
 
-- `SpeedSetpoint` updates the straight-line controller target
-- `SpeedKp`, `SpeedKi`, `SpeedKd` tune the speed PID
-- `SteeringKp`, `SteeringKi`, `SteeringKd` tune the steering-angle PID
+- `SteeringKp`, `SteeringKi`, `SteeringKd` — tune the steering-angle PID
+
+(Speed constants are parsed but currently no-ops; throttle is open-loop in the present firmware.)
 
 Core 0 does not cache or deduplicate these values anymore; it only parses the USB command and forwards the event.
 
 #### Camera alignment delivery
 
-The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. Core 1 stores the latest angle from that event and uses it as the steering PID process variable. The confidence value is carried along for future filtering/fusion work, but it is not yet used in the live control law.
+The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. On Core 1, the raw angle is immediately passed through an **RLS (Recursive Least Squares) angle filter** before being stored as `latest_camera_angle_deg`. The confidence value is carried along for future use but is not yet applied.
 
-At the moment, the EKF is not the trusted steering-angle source. The loop therefore uses a simple rule:
-
-- if a new `CameraAlign` angle has been seen, steer from that latest angle
-- otherwise fall back to the filter heading value
-
-This keeps the interface ready for future fusion without blocking the current steering path on unfinished EKF work.
+The steering PID uses `latest_camera_angle_deg` directly as its process variable. If no alignment has ever been received, the angle defaults to `0.0` (straight ahead).
 
 #### Core 1 event flow
 
-Core 1 now follows the same high-level sequence on every `SensorReady` event:
+Core 1 follows the same high-level sequence on every `SensorReady` event:
 
-1. dequeue one `SensorEvent`
-2. update internal state from that event
-3. run the current predict step
-4. recompute control outputs
-5. emit a fresh `ControlOutput` and `LogData`
+1. Dequeue one `SensorEvent` and update internal state.
+2. Advance the drive-mode state machine (startup → straight, straight → turning, turning → straight).
+3. Recompute control outputs from the current drive mode.
+4. Emit a fresh `ControlOutput` and `LogData`.
 
-For `Encoder`, the predict step uses the new speed measurement and advances the steering PID by one encoder-distance increment. For `EncoderTimeout`, `CameraAlign`, `ConstantUpdate`, and `Distances`, Core 1 performs a predict-only step and re-emits control using the latest known camera angle. This is why Core 0's timeout event is sufficient to keep the controller alive during encoder silence; no separate Core 1 tick is required.
+Event-specific effects:
+
+| Event | Effect on state |
+| ----- | --------------- |
+| `Encoder` | Sets `distance_increment_m = LENGTH_PER_HAL_RISE_METERS`; steering PID steps by that distance |
+| `EncoderTimeout` | No distance increment; steering PID does not step |
+| `CameraAlign` | Raw angle fed through RLS filter; result stored as `latest_camera_angle_deg` |
+| `Distances` | Left/right used by turn-trigger detection; no steering update itself |
+| `ConstantUpdate` | Updates steering PID gains in-place |
+
+Every event still produces a `ControlOutput` — the current drive mode decides what PWM values to emit regardless of which input arrived.
 
 #### Queues
 
@@ -328,7 +332,7 @@ The interrupt records the **time between two consecutive rising edges**. Speed i
 
 $$v = \frac{d}{t}$$
 
-Where $d$ is the distance one magnet-spacing represents (`13 × π / 300` meters, based on the wheel geometry) and $t$ is the measured time between pulses.
+Where $d$ is the distance one magnet-spacing represents (`13 × π / 600` meters, based on the wheel geometry) and $t$ is the measured time between pulses.
 
 ---
 
@@ -342,8 +346,14 @@ The microcontroller appears as a **virtual serial port** on the PC. You can use 
 | ------- | ------- | ------ |
 | `pwm-a <microseconds>` | `pwm-a 1700` | Set PWM-A on-time to 1700 µs |
 | `pwm-b <microseconds>` | `pwm-b 1200` | Set PWM-B on-time to 1200 µs |
-| `const <constant> <value>` | `const speed 1.2` | Set speed controller target to 1.2 m/s (or tune PID constants) |
+| `const <constant> <value>` | `const steering_kp 50` | Tune a PID constant on Core 1 |
 | `align <angle> <confidence>` | `align 45.5 0.95` | Send raw camera alignment (angle in degrees, confidence 0-1) |
+| `mode manual` | `mode manual` | Put both steering and throttle in manual mode |
+| `mode auto` | `mode auto` | Put both steering and throttle under Core 1 control |
+| `mode steering manual` | `mode steering manual` | Manual steering only (throttle unchanged) |
+| `mode steering auto` | `mode steering auto` | Auto steering only (throttle unchanged) |
+| `mode throttle manual` | `mode throttle manual` | Manual throttle only (steering unchanged) |
+| `mode throttle auto` | `mode throttle auto` | Auto throttle only (steering unchanged) |
 
 The `const` command accepts these constant names:
 - `speed`, `setpoint`, `speed_setpoint` — target speed in m/s

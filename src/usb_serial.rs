@@ -20,13 +20,26 @@ pub enum ControlMode {
     Auto,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlModes {
+    pub steering: ControlMode,
+    pub throttle: ControlMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlTarget {
+    Steering,
+    Throttle,
+    Both,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UsbCommand {
     SetPwmA { on_time_us: u32 },
     SetPwmB { on_time_us: u32 },
     SetConstant { constant: Constants, value: f32 },
     SendAlign { angle: f32, confidence: f32 },
-    SetControlMode { mode: ControlMode },
+    SetControlMode { target: ControlTarget, mode: ControlMode },
 }
 
 pub fn init_usb_serial(
@@ -142,9 +155,9 @@ pub fn process_usb_command(
                 info!("Invalid align value: {}", rest);
             }
         } else if let Some(rest) = command.strip_prefix("mode ") {
-            if let Some(mode) = parse_control_mode(rest) {
+            if let Some((target, mode)) = parse_control_mode(rest) {
                 send_ok(&mut usb_dev, &mut serial);
-                return Some(UsbCommand::SetControlMode { mode });
+                return Some(UsbCommand::SetControlMode { target, mode });
             } else {
                 info!("Invalid control mode: {}", rest);
             }
@@ -177,12 +190,35 @@ fn parse_constant_update(arg: &str) -> Option<(Constants, f32)> {
     Some((constant, value))
 }
 
-fn parse_control_mode(arg: &str) -> Option<ControlMode> {
-    match arg.trim() {
-        "manual" => Some(ControlMode::Manual),
-        "auto" => Some(ControlMode::Auto),
-        _ => None,
+fn parse_control_mode(arg: &str) -> Option<(ControlTarget, ControlMode)> {
+    let mut parts = arg.split_ascii_whitespace();
+    let first = parts.next()?;
+    let second = parts.next();
+
+    if parts.next().is_some() {
+        return None;
     }
+
+    let (target, mode_text) = match second {
+        Some(mode_text) => (
+            match first {
+                "steering" => ControlTarget::Steering,
+                "throttle" => ControlTarget::Throttle,
+                "both" => ControlTarget::Both,
+                _ => return None,
+            },
+            mode_text,
+        ),
+        None => (ControlTarget::Both, first),
+    };
+
+    let mode = match mode_text {
+        "manual" => ControlMode::Manual,
+        "auto" => ControlMode::Auto,
+        _ => return None,
+    };
+
+    Some((target, mode))
 }
 
 fn send_ok(

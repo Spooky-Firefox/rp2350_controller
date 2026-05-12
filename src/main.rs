@@ -13,7 +13,7 @@ use rp2350_controller::constants::*;
 use rp2350_controller::entry::entry;
 use rp2350_controller::ipc;
 use rp2350_controller::logging::LogData;
-use rp2350_controller::usb_serial::{ControlMode, init_usb_serial};
+use rp2350_controller::usb_serial::{ControlMode, ControlModes, ControlTarget, init_usb_serial};
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::device::UsbDevice;
 use usbd_serial::SerialPort;
@@ -81,7 +81,7 @@ mod app {
         fifo_rx: ipc::FifoRx,
         sensor_q_tx: heapless::spsc::Producer<'static, ipc::SensorEvent, 4>,
         log_q_tx_core0: heapless::spsc::Producer<'static, LogData, 128>,
-        control_mode: ControlMode,
+        control_mode: ControlModes,
         power: u16,
     }
 
@@ -241,9 +241,15 @@ mod app {
                 sensor_q_tx,
                 log_q_tx_core0,
                 control_mode: if ENABLE_USB_INTERRUPT {
-                    ControlMode::Manual
+                    ControlModes {
+                        steering: ControlMode::Manual,
+                        throttle: ControlMode::Manual,
+                    }
                 } else {
-                    ControlMode::Auto
+                    ControlModes {
+                        steering: ControlMode::Auto,
+                        throttle: ControlMode::Auto,
+                    }
                 },
                 power: 0,
             },
@@ -428,25 +434,42 @@ mod app {
             match ipc::IpcSignal::from_u32(word) {
                 Some(ipc::IpcSignal::ControlReady) => {
                     if let Some(output) = ctx.local.control_q_rx.dequeue() {
-                        let is_auto = control_mode.lock(|mode| *mode == ControlMode::Auto);
-                        if is_auto {
+                        let (steering_auto, throttle_auto) = control_mode.lock(|mode| {
+                            (
+                                mode.steering == ControlMode::Auto,
+                                mode.throttle == ControlMode::Auto,
+                            )
+                        });
+                        if steering_auto || throttle_auto {
                             let steer_on = MicrosDurationU32::from_ticks(output.steer_pwm_us as u32)
                                 .min(PWM_PERIOD);
                             let power_on = MicrosDurationU32::from_ticks(output.power_pwm_us as u32)
                                 .min(PWM_PERIOD);
                             pwm.lock(|pwm| {
-                                let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
-                                let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+                                if steering_auto {
+                                    let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
+                                }
+                                if throttle_auto {
+                                    let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+                                }
                             });
-                            power.lock(|p| *p = output.power_pwm_us);
+                            if throttle_auto {
+                                power.lock(|p| *p = output.power_pwm_us);
+                            }
                             trace!(
-                                "ctrl auto: steer={} us  power={} us",
-                                output.steer_pwm_us, output.power_pwm_us
+                                "ctrl auto: steer={} us [{}] power={} us [{}]",
+                                output.steer_pwm_us,
+                                if steering_auto { "auto" } else { "manual" },
+                                output.power_pwm_us,
+                                if throttle_auto { "auto" } else { "manual" }
                             );
                         } else {
                             trace!(
-                                "ctrl ignored in manual mode: steer={} us  power={} us",
-                                output.steer_pwm_us, output.power_pwm_us
+                                "ctrl ignored in manual mode: steer={} us [{}] power={} us [{}]",
+                                output.steer_pwm_us,
+                                if steering_auto { "auto" } else { "manual" },
+                                output.power_pwm_us,
+                                if throttle_auto { "auto" } else { "manual" }
                             );
                         }
                     }
@@ -510,8 +533,15 @@ mod app {
                 });
                 ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
             }
-            Some(UsbCommand::SetControlMode { mode }) => {
-                ctx.shared.control_mode.lock(|current| *current = mode);
+            Some(UsbCommand::SetControlMode { target, mode }) => {
+                ctx.shared.control_mode.lock(|current| match target {
+                    ControlTarget::Steering => current.steering = mode,
+                    ControlTarget::Throttle => current.throttle = mode,
+                    ControlTarget::Both => {
+                        current.steering = mode;
+                        current.throttle = mode;
+                    }
+                });
             }
             None => {}
         }

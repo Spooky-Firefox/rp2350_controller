@@ -1,11 +1,11 @@
-function data = plot_drive_log(csv_file, length_per_rotation_m, remove_segments_s, plot_slice_s)
+function data = plot_drag(csv_file, length_per_rotation_m, remove_segments_s, plot_slice_s)
 % Plot speed, derived position, acceleration, and control commands from a drive log CSV.
 %
 % Usage:
-%   plot_drive_log("log_20260509_111211.csv")
-%   plot_drive_log(csv_file, 0.0303)
-%   plot_drive_log(csv_file, 0.0303, [3.0 4.2; 8.5 9.0])
-%   plot_drive_log(csv_file, 0.0303, [3.0 4.2], [2.0 12.0])
+%   plot_drag("log_20260509_111211.csv")
+%   plot_drag(csv_file, 0.0303)
+%   plot_drag(csv_file, 0.0303, [3.0 4.2; 8.5 9.0])
+%   plot_drag(csv_file, 0.0303, [3.0 4.2], [2.0 12.0])
 %
 % Inputs:
 %   csv_file               Path to CSV with columns:
@@ -47,25 +47,9 @@ function data = plot_drive_log(csv_file, length_per_rotation_m, remove_segments_
     end
 
     t_s = (double(T.timestamp_us) - double(T.timestamp_us(1))) * 1e-6;
-    speed_logged_mps = double(T.speed_mps);
+    speed_mps = double(T.speed_mps);
     throttle_us = double(T.throttle_us);
     steer_us = double(T.steer_us);
-
-    % Infer speed from wheel rotation timing, but keep stopped samples at zero.
-    dt_for_speed = [NaN; diff(t_s)];
-    if numel(dt_for_speed) >= 2 && ~isfinite(dt_for_speed(1))
-        dt_for_speed(1) = dt_for_speed(2);
-    end
-    moving_mask = isfinite(speed_logged_mps) & (speed_logged_mps ~= 0);
-    valid_dt_mask = isfinite(dt_for_speed) & dt_for_speed > 0;
-    speed_mps = zeros(size(speed_logged_mps));
-    infer_mask = moving_mask & valid_dt_mask;
-    speed_mps(infer_mask) = length_per_rotation_m ./ dt_for_speed(infer_mask);
-
-    % Drop speed spikes that jump too much between consecutive samples.
-    max_speed_step_mps = 1.0;
-    speed_step_mps = [0; abs(diff(speed_mps))];
-    speed_mps(speed_step_mps > max_speed_step_mps) = NaN;
 
     if ~ismatrix(remove_segments_s) || size(remove_segments_s, 2) ~= 2
         error("remove_segments_s must be an Nx2 matrix: [t_start t_end; ...]");
@@ -155,7 +139,7 @@ function data = plot_drive_log(csv_file, length_per_rotation_m, remove_segments_
     plot(t_plot, speed_rot_plot, "--", "LineWidth", 1.0);
     grid on;
     ylabel("Speed [m/s]");
-    legend("Inferred speed", "Speed from rotation timing", "Location", "best");
+    legend("Logged speed", "Speed from rotation timing", "Location", "best");
     title(sprintf("%s", csv_file), "Interpreter", "none", "FontSize", 10);
 
     nexttile;

@@ -16,8 +16,8 @@ const PWM_DIV_INT: u8 = 64;
 const PWM_TIMER_HZ: u32 = SYS_CLOCK_HZ / (1 + PWM_DIV_INT as u32);
 const PWM_PERIOD: MicrosDurationU32 = MicrosDurationU32::from_ticks(20_000);
 const PWM_DEFAULT_ON_TIME: MicrosDurationU32 = MicrosDurationU32::from_ticks(1_500);
-/// Arc length per encoder pulse [m]: 13π/300
-const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 0.13613568;
+/// Arc length per encoder pulse [m].
+const LENGTH_PER_ENCODER_PULSE_METERS: f32 = 0.0303;
 
 // ────────────── Type aliases ──────────────
 type LedPin =

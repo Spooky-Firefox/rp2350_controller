@@ -20,9 +20,8 @@ function sim_data = generate_kalman_data(output_file)
     PLANT.W   = 0.200;    % track width [m]
     PLANT.wheel_circumference = 2 * pi * PLANT.r_w;  % full wheel circumference [m]
     PLANT.pulses_per_rotation = 3;                    % encoder pulses per full rotation
-    PLANT.encoder_trigger_distance_scale = 0.5;       % encoder triggers twice per expected arc step
-    PLANT.pulse_distance = (PLANT.wheel_circumference / PLANT.pulses_per_rotation) ...
-        * PLANT.encoder_trigger_distance_scale;        % [m/pulse]
+    PLANT.encoder_trigger_distance_scale = 1.0;       % measured distance is used directly
+    PLANT.pulse_distance = 0.0303;                    % [m/pulse] measured
 
     % Steering actuator (2nd-order) and PWM mapping configuration.
     PLANT.steer.max_angle_deg = 28;          % +/- max steering angle [deg]
@@ -35,6 +34,9 @@ function sim_data = generate_kalman_data(output_file)
     PLANT.throttle.max_accel_rev = 1.8;      % [m/s^2]
     PLANT.throttle.drag_k0 = 3.669;          % rolling resistance [m/s^2] — measured
     PLANT.throttle.drag_k1 = 0.201;          % viscous drag [1/s]         — measured
+    PLANT.throttle.throttle_tau_s = 0.12;    % first-order throttle lag [s]
+    PLANT.throttle.back_emf_gain = 0.25;     % torque drop with speed [s/m]
+    PLANT.throttle.forward_only = true;
 
     % Timing uncertainty per wheel pulse.
     % On real hardware this is your timer resolution + interrupt latency.
@@ -74,12 +76,17 @@ function sim_data = generate_kalman_data(output_file)
     % Integrate the bicycle model to create the ground-truth trajectory.
     x_true = zeros(4, N);
     x_true(:,1) = [0; 0; 0; 0];
+    throttle_cfg = PLANT.throttle;
+    throttle_cfg.dt = dt_sim;
+    throttle_cfg.reset = true;
+    throttle_pwm_to_accel(1500, 0, throttle_cfg);
+    throttle_cfg.reset = false;
     for k = 1:N-1
         [delta_true(k), delta_dot] = steering_actuator_step( ...
             delta_true(k), delta_dot, pwm_steer(k), dt_sim, PLANT.steer);
 
         a_long_true(k) = throttle_pwm_to_accel(pwm_throttle(k), ...
-            x_true(4, k), PLANT.throttle);
+            x_true(4, k), throttle_cfg);
 
         x_true(:,k+1) = bicycle_step(x_true(:,k), ...
             delta_true(k), a_long_true(k), dt_sim, PLANT);

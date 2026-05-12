@@ -6,13 +6,12 @@ use crate::controller_processor::kalman_filter;
 use crate::ipc::{self, IpcSignal, SensorEvent, TimeExtender};
 use crate::logging::LogData;
 
-use core::f32::consts::PI;
 use fugit::TimerInstantU64;
 use heapless::spsc::{Consumer, Producer};
 use rp235x_hal as hal;
 
 /// Arc length per encoder magnet pulse [m].
-const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 600.0;
+const LENGTH_PER_HAL_RISE_METERS: f32 = 0.0303;
 
 /// Entry point for Core 1.  Called from the RTIC `init` on Core 0 via
 /// `core.spawn(...)`.  Runs a blocking event loop that never returns.

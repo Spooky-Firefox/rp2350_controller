@@ -28,6 +28,11 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 static CORE1_STACK: Stack<4096> = Stack::new();
 
+// Compile-time interrupt gates.
+// Set to `false` to disable handling for the corresponding interrupt source.
+const ENABLE_USB_INTERRUPT: bool = true;
+const ENABLE_CORE1_INTERRUPT: bool = true;
+
 // Shorthand for GPIO25 configured as a digital output (LED pin).
 type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullDown>;
 
@@ -235,7 +240,11 @@ mod app {
                 fifo_rx,
                 sensor_q_tx,
                 log_q_tx_core0,
-                control_mode: ControlMode::Manual,
+                control_mode: if ENABLE_USB_INTERRUPT {
+                    ControlMode::Manual
+                } else {
+                    ControlMode::Auto
+                },
                 power: 0,
             },
             Local {
@@ -401,6 +410,20 @@ mod app {
         let mut power = ctx.shared.power;
         let mut control_mode = ctx.shared.control_mode;
 
+        if !ENABLE_CORE1_INTERRUPT {
+            // Drain FIFO and matching queue items to avoid backpressure deadlocks
+            // when Core 1 keeps signaling while this handler is disabled.
+            while let Some(word) = fifo_rx.lock(|rx| rx.try_read()) {
+                if matches!(
+                    ipc::IpcSignal::from_u32(word),
+                    Some(ipc::IpcSignal::ControlReady)
+                ) {
+                    let _ = ctx.local.control_q_rx.dequeue();
+                }
+            }
+            return;
+        }
+
         while let Some(word) = fifo_rx.lock(|rx| rx.try_read()) {
             match ipc::IpcSignal::from_u32(word) {
                 Some(ipc::IpcSignal::ControlReady) => {
@@ -445,6 +468,12 @@ mod app {
 
         let buff = ctx.local.buff;
         let buff_len = ctx.local.buff_len;
+
+        if !ENABLE_USB_INTERRUPT {
+            // Still poll/drain USB state so the interrupt line can clear.
+            let _ = process_usb_command(usb_dev, serial, buff, buff_len);
+            return;
+        }
 
         match process_usb_command(usb_dev, serial, buff, buff_len) {
             Some(UsbCommand::SetPwmA { on_time_us }) => {

@@ -104,27 +104,24 @@ impl Controller for StraightLineSpeedController {
 
 /// PID controller for steering-angle tracking.
 ///
-/// The current setpoint is fixed at straight-ahead (`0.0` rad). A future
-/// wall-following or path planner can set `angle_setpoint_rad` instead of
+/// The current setpoint is fixed at straight-ahead (`0.0` deg). A future
+/// wall-following or path planner can set `angle_setpoint_deg` instead of
 /// directly commanding PWM.
 pub struct SteeringAngleController {
     pub pid: Pid,
-    pub angle_setpoint_rad: f32,
+    pub angle_setpoint_deg: f32,
     pub neutral_steering_pwm_us: u16,
     pub min_steering_pwm_us: u16,
     pub max_steering_pwm_us: u16,
 }
 
 impl SteeringAngleController {
-    /// Update steering using distance travelled as the PID step basis.
-    ///
-    /// Raw sensor angle is used as the process variable for now. Once the EKF
-    /// heading estimate is trustworthy, pass that angle here instead.
-    pub fn update(&mut self, measured_angle_rad: f32, distance_increment_m: f32) -> u16 {
-        let error = self.angle_setpoint_rad - measured_angle_rad;
-        let steering_output = self.pid.update(error, distance_increment_m);
+    /// Update steering using the provided PID step size.
+    pub fn update(&mut self, measured_angle_deg: f32, step: f32) -> u16 {
+        let error = self.angle_setpoint_deg - measured_angle_deg;
+        let steering_output = self.pid.update(error, step);
 
-        (self.neutral_steering_pwm_us as f32 + steering_output).clamp(
+        (self.neutral_steering_pwm_us as f32 - steering_output).clamp(
             self.min_steering_pwm_us as f32,
             self.max_steering_pwm_us as f32,
         ) as u16
@@ -133,5 +130,75 @@ impl SteeringAngleController {
     /// Reset controller state.
     pub fn reset(&mut self) {
         self.pid.reset();
+    }
+}
+
+/// Recursive Least Squares (RLS) filter for camera angle estimation.
+///
+/// Tracks the camera angle with adaptive filtering that rejects noise
+/// while adapting to gradual changes in the true angle.
+#[derive(Clone, Copy, Debug)]
+pub struct RlsAngleFilter {
+    /// Estimated angle [deg]
+    pub angle_estimate_deg: f32,
+    /// Covariance (confidence in estimate)
+    pub covariance: f32,
+    /// Forgetting factor: 0.95..1.0 (lower = faster adaptation, higher = more stable)
+    pub lambda: f32,
+    /// Measurement noise variance (tuning parameter)
+    pub measurement_noise_variance: f32,
+}
+
+impl RlsAngleFilter {
+    /// Create a new RLS filter with default tuning.
+    pub const fn new() -> Self {
+        Self {
+            angle_estimate_deg: 0.0,
+            covariance: 1.0,
+            lambda: 0.98,
+            measurement_noise_variance: 0.5,
+        }
+    }
+
+    /// Create a new RLS filter with custom forgetting factor and noise variance.
+    pub const fn with_params(lambda: f32, measurement_noise_variance: f32) -> Self {
+        Self {
+            angle_estimate_deg: 0.0,
+            covariance: 1.0,
+            lambda,
+            measurement_noise_variance,
+        }
+    }
+
+    /// Update the filter with a new angle measurement.
+    ///
+    /// Returns the filtered (estimated) angle.
+    pub fn update(&mut self, measured_angle_deg: f32) -> f32 {
+        if !measured_angle_deg.is_finite() {
+            return self.angle_estimate_deg;
+        }
+
+        // RLS scalar update:
+        // - Innovation (measurement residual)
+        let innovation = measured_angle_deg - self.angle_estimate_deg;
+
+        // - Kalman gain
+        let denominator = self.lambda + self.covariance;
+        let kalman_gain = self.covariance / denominator;
+
+        // - Update estimate
+        self.angle_estimate_deg += kalman_gain * innovation;
+
+        // - Update covariance (discounted by lambda for forgetting)
+        self.covariance = (self.covariance - kalman_gain * self.covariance) / self.lambda;
+        self.covariance = self.covariance.max(0.01);
+
+        self.angle_estimate_deg
+    }
+
+    /// Reset filter state.
+    pub fn reset(&mut self) {
+        self.angle_estimate_deg = 0.0;
+        self.covariance = 1.0;
     }
 }

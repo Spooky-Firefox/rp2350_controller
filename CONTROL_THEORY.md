@@ -3,35 +3,38 @@
 This note explains what the control-side code is doing in plain engineering terms.
 Relevant source files:
 
-- `src/controller_processor/controller.rs` — PID and RLS filter structs
+- `src/controller_processor/controller.rs` — Heading observer (bicycle predict-correct), PID, and control logic
 - `src/controller_processor/controller_processor_loop.rs` — Core 1 event loop and drive-mode logic
 
 ## Big Picture
 
 Core 1 does two jobs:
 
-1. **Estimate** the camera-derived steering angle (via RLS filtering).
+1. **Estimate** the vehicle heading using a bicycle-model predict-correct observer.
+   - **Predict** on encoder ticks: advance heading from steering command and distance traveled.
+   - **Correct** on camera updates: fuse low-rate camera angle measurements.
 2. **Turn that estimate into actuator commands** according to the current drive mode.
 
-There is no Kalman filter. Throttle is open-loop (fixed PWM), and steering is closed-loop on camera angle.
+Throttle is open-loop (fixed PWM), and steering is closed-loop on the observer-estimated heading.
 
 The data flow is:
 
 ```text
-SensorEvent::CameraAlign { angle, confidence }
-            |
-            v
-  RlsAngleFilter.update(angle) → filtered_angle_deg
-            |
-            v
-  SteeringAngleController.update(filtered_angle, distance_increment)
-            → steer_pwm_us
-
 SensorEvent::Encoder { rpm_period_us }
             |
             v
-  distance_increment_m = LENGTH_PER_HAL_RISE_METERS
-  (used as the PID step size for the steering controller above)
+  distance_increment_m = LENGTH_PER_ENCODER_PULSE_METERS
+  HeadingObserver.predict(distance, steering_pwm, wheelbase, ...)
+            → heading_estimate_deg (advanced via bicycle model)
+            |
+            v
+  SteeringAngleController.update(heading_estimate, distance_increment)
+            → steer_pwm_us
+
+SensorEvent::CameraAlign { angle, confidence }
+            |
+            v
+  HeadingObserver.correct(angle) → heading_estimate_deg (fused with camera)
 
 SensorEvent::Distances { left_cm, center_cm, right_cm }
             |
@@ -40,7 +43,10 @@ SensorEvent::Distances { left_cm, center_cm, right_cm }
   → may switch DriveMode to Turning { direction }
 
 SensorEvent::EncoderTimeout
-  → distance_increment_m = 0.0 (steering PID does not step)
+  → distance_increment_m = 0.0 (steering PID does not step; observer predict skipped)
+
+SensorEvent::ConstantUpdate { constant, value }
+  → may update observer tuning (process noise Q, measurement noise R, initial covariance P0)
 ```
 
 ---
@@ -79,49 +85,94 @@ the vehicle has completed the corner.
 
 ---
 
-## RLS Angle Filter
+## Heading Observer (Bicycle Predict-Correct)
 
-The camera angle arriving over USB can be noisy. The **Recursive Least Squares (RLS)** filter smooths it
-adaptively while still tracking genuine changes.
+The vehicle heading is estimated using a lightweight **bicycle-model predict-correct observer** that handles sparse camera measurements (~7 FPS) by predicting heading changes between updates.
 
-The scalar update equations are:
+### Predict Step (on encoder distance increments)
 
-$$K_n = \frac{P_{n-1}}{\lambda + P_{n-1}}$$
+The **kinematic bicycle model** predicts heading change from steering angle and distance traveled:
 
-$$\hat{\theta}_n = \hat{\theta}_{n-1} + K_n\,(z_n - \hat{\theta}_{n-1})$$
-
-$$P_n = \frac{P_{n-1} - K_n P_{n-1}}{\lambda}$$
+$$\Delta\theta = \frac{ds}{L} \tan(\delta)$$
 
 where:
 
-- $z_n$ is the raw measured angle
-- $\hat{\theta}_n$ is the filtered angle estimate
-- $P_n$ is the estimate covariance (confidence)
-- $K_n$ is the adaptive gain (Kalman-style)
-- $\lambda \in (0,1]$ is the **forgetting factor**
+- $\Delta\theta$ is the heading change [rad]
+- $ds$ is distance traveled since last update [m] — from encoder increments
+- $L$ is wheelbase [m]
+- $\delta$ is front-wheel steering angle [rad]
 
-Tuning knobs (set in `controller_processor_loop.rs`):
+The steering angle is derived from the PWM command:
 
-| Parameter | Value | Effect |
-| --------- | ----- | ------ |
-| `lambda` | 0.98 | Close to 1 → stable, slow to adapt; lower → faster but noisier |
-| `measurement_noise_variance` | 0.5 | Higher → trust model more, smoother output |
+$$\delta = (\text{steering\_pwm\_us} - \text{neutral\_pwm\_us}) \times \text{steering\_angle\_per\_us\_deg} \times \frac{\pi}{180}$$
 
-When $\lambda = 1$ the filter is equivalent to a simple running average with no forgetting.
-The current value of 0.98 means measurements older than ~50 samples contribute negligibly.
+After prediction, covariance increases by the **process noise** $Q$ to reflect growing uncertainty.
+
+### Correct Step (on camera alignment)
+
+Camera angle measurements are fused using a **scalar Kalman-style correction**:
+
+$$K = \frac{P^-}{P^- + R}$$
+
+$$\hat{\theta} = \hat{\theta}^- + K\,(z - \hat{\theta}^-)$$
+
+$$P = (1 - K) P^-$$
+
+where:
+
+- $\hat{\theta}^-$ is the predicted heading (before correction)
+- $z$ is the camera-measured angle
+- $K$ is the Kalman gain (0 to 1)
+- $P^-$ is the prediction-step covariance (uncertainty)
+- $R$ is measurement noise (camera angle uncertainty)
+- $P$ is the corrected covariance
+
+**Intuition**: if the camera is noisy ($R$ high), $K$ is small → measurement has little effect. If the model is uncertain ($P^-$ high), $K$ is large → measurement pulls the estimate strongly toward the camera angle.
+
+### Compile-Time Vehicle Geometry Constants
+
+Located in `src/constants.rs`:
+
+| Constant | Default | Typical Range | Notes |
+| -------- | ------- | ------------- | ----- |
+| `OBSERVER_WHEELBASE_METERS` | 0.12 m | 0.08–0.15 m | Distance between front and rear axles |
+| `OBSERVER_STEERING_ANGLE_PER_US_DEG` | 0.1 deg/µs | 0.05–0.15 deg/µs | Servo response: angle change per PWM microsecond from neutral |
+| `OBSERVER_NEUTRAL_STEERING_PWM_US` | 1500 µs | 1500 µs | Neutral servo position (straight ahead) |
+
+These are fixed vehicle geometry and do not change at runtime. Measure or estimate them from your platform.
+
+### Runtime Tuning Constants
+
+Three observer parameters can be adjusted at runtime via `const` commands:
+
+| Parameter | USB Command | Range | Default | Effect |
+| --------- | ----------- | ----- | ------- | ------ |
+| Process noise $Q$ | `const observer_q <value>` | 0.001–1.0 | 0.01 | Higher → trust predictions less, require more camera feedback; lower → smooth predictions dominate |
+| Measurement noise $R$ | `const observer_r <value>` | 0.01–2.0 | 0.5 | Higher → trust camera less, rely on model; lower → camera pulls estimate strongly |
+| Covariance $P_0$ | `const observer_p0 <value>` | 0.1–5.0 | 1.0 | Initial uncertainty at startup; affects gain weighting in early corrections |
+
+### Tuning Guidance
+
+**Oscillation (steering left-right):** Increase `observer_r` (trust camera less, model more) so camera noise doesn't pull heading estimate around.
+
+**Sluggish response:** Decrease `observer_r` (trust camera more) or increase `observer_q` (lower prediction trust) so camera corrections pull estimate faster.
+
+**Drift between camera frames:** Decrease `observer_q` (higher model trust) so predicted heading changes accumulate; or check wheelbase/steering-angle calibration.
+
+**Noisy camera angle:** Increase `observer_r` to dampen camera noise; the observer will rely more on the prediction from steering+motion.
 
 ---
 
 ## Steering Angle PID
 
-`SteeringAngleController` runs a standard PID on camera-angle error:
+`SteeringAngleController` runs a standard PID on observer-estimated heading error:
 
-$$e = \theta_{setpoint} - \theta_{filtered}$$
+$$e = \theta_{setpoint} - \hat{\theta}_{observer}$$
 
 $$u_{steer} = u_{neutral} - \left( K_p\,e + K_i \int e\,ds + K_d \frac{de}{ds} \right)$$
 
 Note the **integral and derivative step** is the **encoder distance increment** $ds$
-(`LENGTH_PER_HAL_RISE_METERS = 13\pi/600` m per Hall rise), not wall-clock time.
+(`LENGTH_PER_ENCODER_PULSE_METERS = 13\pi/600` m per Hall rise), not wall-clock time.
 This means the PID only integrates while the vehicle is moving.
 
 Output is clamped to [1250, 1750] µs.
@@ -138,11 +189,10 @@ Output is clamped to [1250, 1750] µs.
 ### Tuning Guidance
 
 - Too much `kp` → steering oscillates left/right at high frequency.
-- Too much `kd` → amplifies noise in the camera angle; feels twitchy.
-- `ki` is currently 0 because the RLS filter already removes slow drift; re-enable if persistent
-  steady-state offset is observed.
-- Increase `lambda` toward 1.0 for smoother angle tracking on a clean surface; decrease toward 0.95
-  for faster adaptation when the camera angle source is high-latency.
+- Too much `kd` → amplifies noise in the observer heading estimate; feels twitchy.
+- `ki` is currently 0 because the observer already removes slow drift via predict-correct; re-enable if persistent
+  steady-state offset is observed (e.g., systematic camera bias).
+- Increase `observer_r` (reduce measurement noise weight) to smooth PID input; decrease to make corrections tighter.
 
 ---
 
@@ -174,17 +224,17 @@ mode steering auto     ← let Core 1 control steering
 
 ---
 
-## Why No Kalman Filter?
+## Why Bicycle Predict-Correct Instead of EKF?
 
 An Extended Kalman Filter (EKF) was present in earlier revisions for speed estimation and heading tracking.
-It was removed because:
+A scalar predict-correct observer was chosen instead because:
 
-1. Throttle is now open-loop — there is no speed setpoint to track via EKF.
-2. Camera angle from the `align` command already provides heading directly; dead reckoning is not needed.
-3. The RLS scalar filter is simpler to tune and sufficient for the current noise level.
+1. **Simplicity and latency**: Bicycle kinematics + scalar Kalman gain is lightweight and runs in microseconds. EKF would require matrix operations.
+2. **Camera-only heading need**: We only need to estimate heading, not speed or position. Throttle is open-loop (fixed PWM).
+3. **Sparse measurements**: At ~7 FPS, a predict step is crucial to handle gaps between camera updates. The bicycle model elegantly captures steering+motion effects between frames.
+4. **Tuning**: Three scalar parameters (process noise, measurement noise, covariance) are easier to reason about than full-state EKF covariance matrices.
 
-The EKF infrastructure may be reintroduced if absolute position tracking or speed-closed-loop control
-becomes a requirement.
+A full EKF can be reintroduced if absolute position tracking or speed-closed-loop control becomes a requirement.
 
 ---
 
@@ -195,10 +245,10 @@ Start in `controller_processor_loop.rs`:
 - `core1_task()` — entry point, initialises state, runs the blocking read loop
 - `handle_sensor_event()` — dispatches per-event state updates, drives mode transitions, calls `emit_control_output`
 - `Core1State::maybe_enter_turning_mode()` — turn-trigger logic using HC-SR04 left/right readings
-- `Core1State::maybe_exit_turning_mode()` — turn-exit logic using camera angle flip
+- `Core1State::maybe_exit_turning_mode()` — turn-exit logic using observer heading flip
 
 Then look in `controller.rs`:
 
+- `HeadingObserver` — bicycle predict and Kalman-style correct methods
 - `SteeringAngleController` — PID wrapper with clamped output
-- `RlsAngleFilter` — scalar RLS estimator
 - `Pid` — general PID building block

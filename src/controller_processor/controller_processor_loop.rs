@@ -1,21 +1,20 @@
 //! Core 1 event loop for sensor processing and control.
 #![deny(unsafe_code)]
 
-use crate::controller_processor::controller::{Pid, RlsAngleFilter, SteeringAngleController};
+use crate::controller_processor::controller::{Pid, HeadingObserver, SteeringAngleController};
 use crate::ipc::{self, Constants, IpcSignal, SensorKind, TimeExtender};
 use crate::logging::{LogData, LogEvent};
+use crate::constants;
 
 use defmt::info;
 use fugit::TimerInstantU64;
 use heapless::spsc::{Consumer, Producer};
 use rp235x_hal as hal;
-use core::f32::consts::PI;
 
 type Instant = TimerInstantU64<1_000_000>;
 
 const NEUTRAL_PWM_US: u16 = 1500;
 const STARTUP_DURATION_US: u64 = 5_000_000;
-const LENGTH_PER_HAL_RISE_METERS: f32 = 13.0 * PI / 600.0;
 
 // Straight driving mode outputs.
 const STRAIGHT_THROTTLE_PWM_US: u16 = 1600;
@@ -51,10 +50,10 @@ enum DriveMode {
 
 struct Core1State {
     steering_controller: SteeringAngleController,
-    rls_angle_filter: RlsAngleFilter,
+    heading_observer: HeadingObserver,
     mode: DriveMode,
     startup_until_us: Option<u64>,
-    latest_camera_angle_deg: Option<f32>,
+    last_steering_pwm_us: u16,
     last_left_cm: Option<f32>,
     last_right_cm: Option<f32>,
     left_no_value_streak: u8,
@@ -69,7 +68,7 @@ struct Core1Io<'a> {
 
 impl Core1State {
     fn active_angle_deg(&self) -> f32 {
-        self.latest_camera_angle_deg.unwrap_or(0.0)
+        self.heading_observer.heading_estimate_deg
     }
 
     fn maybe_enter_turning_mode(&mut self, left_cm: f32, right_cm: f32) {
@@ -158,16 +157,14 @@ impl Core1State {
             return;
         }
 
-        let start_angle_sign = self
-            .latest_camera_angle_deg
-            .map(|angle| if angle >= 0.0 { 1 } else { -1 })
-            .unwrap_or(match direction {
-                TurnDirection::Left => 1,
-                TurnDirection::Right => -1,
-            });
+        let start_angle_sign = if self.heading_observer.heading_estimate_deg >= 0.0 {
+            1
+        } else {
+            -1
+        };
 
         self.steering_controller.reset();
-        self.rls_angle_filter.reset();
+        self.heading_observer.reset();
         self.mode = DriveMode::Turning {
             direction,
             start_angle_sign,
@@ -187,9 +184,7 @@ impl Core1State {
             return;
         };
 
-        let Some(angle) = self.latest_camera_angle_deg else {
-            return;
-        };
+        let angle = self.heading_observer.heading_estimate_deg;
 
         let flipped = if start_angle_sign >= 0 {
             angle <= -ANGLE_FLIP_THRESHOLD_DEG
@@ -205,7 +200,7 @@ impl Core1State {
                 ANGLE_FLIP_THRESHOLD_DEG
             );
             self.steering_controller.reset();
-            self.rls_angle_filter.reset();
+            self.heading_observer.reset();
             self.mode = DriveMode::Straight;
             info!("Mode switch: TURNING -> STRAIGHT");
         }
@@ -246,10 +241,10 @@ pub fn core1_task(
             min_steering_pwm_us: 1250,
             max_steering_pwm_us: 1750,
         },
-        rls_angle_filter: RlsAngleFilter::with_params(0.98, 0.5),
+        heading_observer: HeadingObserver::new(),
         mode: DriveMode::Startup,
         startup_until_us: None,
-        latest_camera_angle_deg: None,
+        last_steering_pwm_us: NEUTRAL_PWM_US,
         last_left_cm: None,
         last_right_cm: None,
         left_no_value_streak: 0,
@@ -313,19 +308,20 @@ fn handle_sensor_event(
                 Constants::SteeringKp => state.steering_controller.pid.kp = value,
                 Constants::SteeringKi => state.steering_controller.pid.ki = value,
                 Constants::SteeringKd => state.steering_controller.pid.kd = value,
+                Constants::ObserverProcessNoise => state.heading_observer.process_noise = value,
+                Constants::ObserverMeasurementNoise => state.heading_observer.measurement_noise = value,
+                Constants::ObserverCovarianceInit => state.heading_observer.covariance = value,
             }
         }
         SensorKind::CameraAlign { angle, confidence } => {
             let _ = confidence;
-            // Apply RLS filter to smooth the camera angle measurement
-            let filtered_angle = state.rls_angle_filter.update(angle);
-            state.latest_camera_angle_deg = Some(filtered_angle);
+            // Correct heading observer with camera angle measurement
+            state.heading_observer.correct(angle);
             info!(
-                "CameraAlign values: raw_angle_deg={} filtered_angle_deg={} confidence={} rls_covariance={}",
+                "CameraAlign values: raw_angle_deg={} corrected_estimate_deg={} observer_covariance={}",
                 angle,
-                filtered_angle,
-                confidence,
-                state.rls_angle_filter.covariance
+                state.heading_observer.heading_estimate_deg,
+                state.heading_observer.covariance
             );
         }
         SensorKind::Distances {
@@ -343,7 +339,16 @@ fn handle_sensor_event(
         }
         SensorKind::Encoder { rpm_period_us } => {
             info!("Encoder value: rpm_period_us={}", rpm_period_us);
-            distance_increment_m = LENGTH_PER_HAL_RISE_METERS;
+            distance_increment_m = constants::LENGTH_PER_ENCODER_PULSE_METERS;
+            
+            // Predict heading observer step using last steering command and distance traveled
+            state.heading_observer.predict(
+                distance_increment_m,
+                state.last_steering_pwm_us,
+                constants::OBSERVER_WHEELBASE_METERS,
+                constants::OBSERVER_STEERING_ANGLE_PER_US_DEG,
+                constants::OBSERVER_NEUTRAL_STEERING_PWM_US,
+            );
         }
         SensorKind::EncoderTimeout => {
             info!("Encoder timeout event");
@@ -356,7 +361,7 @@ fn handle_sensor_event(
             .is_some_and(|startup_until| t_us >= startup_until)
     {
         state.steering_controller.reset();
-        state.rls_angle_filter.reset();
+        state.heading_observer.reset();
         state.mode = DriveMode::Straight;
         info!("Mode switch: STARTUP -> STRAIGHT");
     }
@@ -380,6 +385,9 @@ fn handle_sensor_event(
             (steer_pwm_us, TURN_THROTTLE_PWM_US)
         }
     };
+
+    // Store the steering PWM command for next predict step
+    state.last_steering_pwm_us = steer_pwm_us;
 
     emit_control_output(state, now, steer_pwm_us, power_pwm_us, io);
 }

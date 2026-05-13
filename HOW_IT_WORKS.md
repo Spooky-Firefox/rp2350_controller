@@ -117,11 +117,7 @@ Core 1 owns the actual controller state. When a `ConstantUpdate` arrives, Core 1
 
 Core 0 does not cache or deduplicate these values anymore; it only parses the USB command and forwards the event.
 
-#### Camera alignment delivery
-
-The `align <angle> <confidence>` USB command is converted into `SensorKind::CameraAlign`. On Core 1, the raw angle is immediately passed through an **RLS (Recursive Least Squares) angle filter** before being stored as `latest_camera_angle_deg`. The confidence value is carried along for future use but is not yet applied.
-
-The steering PID uses `latest_camera_angle_deg` directly as its process variable. If no alignment has ever been received, the angle defaults to `0.0` (straight ahead).
+See [CONTROL_THEORY.md](CONTROL_THEORY.md) for details on the heading observer predict-correct mechanism.
 
 #### Core 1 event flow
 
@@ -136,11 +132,11 @@ Event-specific effects:
 
 | Event | Effect on state |
 | ----- | --------------- |
-| `Encoder` | Sets `distance_increment_m = LENGTH_PER_HAL_RISE_METERS`; steering PID steps by that distance |
-| `EncoderTimeout` | No distance increment; steering PID does not step |
-| `CameraAlign` | Raw angle fed through RLS filter; result stored as `latest_camera_angle_deg` |
-| `Distances` | Left/right used by turn-trigger detection; no steering update itself |
-| `ConstantUpdate` | Updates steering PID gains in-place |
+| `Encoder` | Runs observer predict step using distance traveled and last steering command; steering PID also steps by that distance |
+| `EncoderTimeout` | No distance increment; observer predict skipped; steering PID does not step |
+| `CameraAlign` | Runs observer correct step to fuse camera angle measurement toward estimated heading |
+| `Distances` | Left/right used by turn-trigger detection; no observer update itself |
+| `ConstantUpdate` | Updates steering PID gains or observer tuning parameters (process/measurement noise, covariance) in-place |
 
 Every event still produces a `ControlOutput` — the current drive mode decides what PWM values to emit regardless of which input arrived.
 

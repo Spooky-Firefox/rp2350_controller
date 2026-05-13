@@ -60,6 +60,9 @@ pub enum Constants {
     SteeringKp = 4,
     SteeringKi = 5,
     SteeringKd = 6,
+    ObserverProcessNoise = 7,
+    ObserverMeasurementNoise = 8,
+    ObserverCovarianceInit = 9,
 }
 
 impl TryFrom<&str> for Constants {
@@ -74,6 +77,9 @@ impl TryFrom<&str> for Constants {
             "steering_kp" => Ok(Constants::SteeringKp),
             "steering_ki" => Ok(Constants::SteeringKi),
             "steering_kd" => Ok(Constants::SteeringKd),
+            "observer_q" => Ok(Constants::ObserverProcessNoise),
+            "observer_r" => Ok(Constants::ObserverMeasurementNoise),
+            "observer_p0" => Ok(Constants::ObserverCovarianceInit),
             _ => Err(()),
         }
     }

@@ -28,7 +28,11 @@ Firmware for an RP2350-based controller with:
 - Configured system clock: `150 MHz`
 - Core split: Core 0 handles I/O and scheduling, Core 1 runs estimation and control
 
-The current firmware assumes the Hall sensor produces one timing event per magnet pass and converts pulse period into longitudinal speed before handing it to Core 1. Steering currently tracks the latest `CameraAlign` angle with a distance-stepped PID; the EKF plumbing remains in place but is not yet the trusted steering-angle source.
+The current firmware uses a **bicycle-model predict-correct observer** for heading estimation:
+- **Predict step** (on encoder ticks): advances heading estimate using kinematic bicycle kinematics from the last steering command and distance traveled.
+- **Correct step** (on camera alignment): fuses low-rate camera angle measurements using a scalar Kalman-style gain.
+
+This dual-step approach handles the low 7 FPS camera update rate by predicting heading changes between camera frames, improving responsiveness and reducing oscillation compared to measurement-only smoothing. Steering is closed-loop on the observer-estimated heading; throttle remains open-loop (fixed PWM).
 
 ## Start Here
 
@@ -40,8 +44,7 @@ The current firmware assumes the Hall sensor produces one timing event per magne
 - `src/main.rs`: Core 0 application and hardware setup
 - `src/ipc.rs`: typed inter-core messages and FIFO channel wrapper
 - `src/controller_processor/controller_processor_loop.rs`: Core 1 event loop
-- `src/controller_processor/kalman_filter.rs`: estimator math
-- `src/controller_processor/controller.rs`: controller output logic
+- `src/controller_processor/controller.rs`: heading observer (bicycle predict-correct), steering PID, and controller output logic
 - `src/hc_sr04.rs`: async ultrasonic measurement driver using PWM input mode
 - `src/logging.rs`: USB telemetry formatting, including `simple_csv`
 - `src/usb_serial.rs`: USB CDC command parsing and control-mode handling
@@ -98,6 +101,9 @@ Commands are newline-terminated ASCII strings received over the USB CDC serial p
 | `pwm-b <microseconds>` | `pwm-b 1500` | Set PWM channel B directly |
 | `speed <m/s>` | `speed 0.40` | Update the Core 1 speed setpoint |
 | `const steering_kp <value>` | `const steering_kp 50` | Update the Core 1 steering PID gain |
+| `const observer_q <value>` | `const observer_q 0.01` | Update heading observer process noise (prediction trust) |
+| `const observer_r <value>` | `const observer_r 0.5` | Update heading observer measurement noise (camera trust) |
+| `const observer_p0 <value>` | `const observer_p0 1.0` | Update heading observer initial covariance |
 | `mode manual` | `mode manual` | Keep both steering and throttle in manual mode |
 | `mode auto` | `mode auto` | Put both steering and throttle in auto mode |
 | `mode steering manual` | `mode steering manual` | Keep steering manual while leaving throttle unchanged |
@@ -105,7 +111,7 @@ Commands are newline-terminated ASCII strings received over the USB CDC serial p
 | `mode throttle manual` | `mode throttle manual` | Keep throttle manual while leaving steering unchanged |
 | `mode throttle auto` | `mode throttle auto` | Put throttle under Core 1 control only |
 
-The `align <angle> <confidence>` command is also forwarded to Core 1 and updates the latest camera-derived steering angle used by the steering PID.
+The `align <angle> <confidence>` command is also forwarded to Core 1 and used by the heading observer to correct its estimate.
 
 The default is `mode manual`, which prevents Core 0 from applying controller outputs received from Core 1 until auto mode is selected.
 

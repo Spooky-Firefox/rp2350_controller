@@ -204,8 +204,8 @@ mod app {
 
         let (sensor_q_tx, sensor_q_rx) = ctx.local.sensor_q.split();
         let (control_q_tx, control_q_rx) = ctx.local.control_q.split();
-    let (log_q_tx_core0, log_q_rx_core0) = ctx.local.core0_log_q.split();
-    let (log_q_tx_core1, log_q_rx_core1) = ctx.local.core1_log_q.split();
+        let (log_q_tx_core0, log_q_rx_core0) = ctx.local.core0_log_q.split();
+        let (log_q_tx_core1, log_q_rx_core1) = ctx.local.core1_log_q.split();
 
         // Spawn Core 1 for controller processing.
         {
@@ -441,16 +441,20 @@ mod app {
                             )
                         });
                         if steering_auto || throttle_auto {
-                            let steer_on = MicrosDurationU32::from_ticks(output.steer_pwm_us as u32)
-                                .min(PWM_PERIOD);
-                            let power_on = MicrosDurationU32::from_ticks(output.power_pwm_us as u32)
-                                .min(PWM_PERIOD);
+                            let steer_on =
+                                MicrosDurationU32::from_ticks(output.steer_pwm_us as u32)
+                                    .min(PWM_PERIOD);
+                            let power_on =
+                                MicrosDurationU32::from_ticks(output.power_pwm_us as u32)
+                                    .min(PWM_PERIOD);
                             pwm.lock(|pwm| {
                                 if steering_auto {
-                                    let _ = pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
+                                    let _ =
+                                        pwm.channel_a.set_duty_cycle(micros_to_pwm_ticks(steer_on));
                                 }
                                 if throttle_auto {
-                                    let _ = pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
+                                    let _ =
+                                        pwm.channel_b.set_duty_cycle(micros_to_pwm_ticks(power_on));
                                 }
                             });
                             if throttle_auto {
@@ -521,7 +525,9 @@ mod app {
                         defmt::warn!("sensor_q full, constant event dropped");
                     }
                 });
-                ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
+                ctx.shared
+                    .fifo_tx
+                    .lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
             }
             Some(UsbCommand::SendAlign { angle, confidence }) => {
                 let now_us = MainMono::now().ticks();
@@ -531,7 +537,9 @@ mod app {
                         defmt::warn!("sensor_q full, align event dropped");
                     }
                 });
-                ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
+                ctx.shared
+                    .fifo_tx
+                    .lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
             }
             Some(UsbCommand::SetControlMode { target, mode }) => {
                 ctx.shared.control_mode.lock(|current| match target {
@@ -624,7 +632,9 @@ mod app {
                     warn!("sensor_q full, distance event dropped");
                 }
             });
-            ctx.shared.fifo_tx.lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
+            ctx.shared
+                .fifo_tx
+                .lock(|tx| tx.signal(ipc::IpcSignal::SensorReady));
 
             next += INTER_SENSOR_DELAY_US.micros();
             MainMono::delay_until(next).await;

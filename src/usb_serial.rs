@@ -35,11 +35,24 @@ pub enum ControlTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UsbCommand {
-    SetPwmA { on_time_us: u32 },
-    SetPwmB { on_time_us: u32 },
-    SetConstant { constant: Constants, value: f32 },
-    SendAlign { angle: f32, confidence: f32 },
-    SetControlMode { target: ControlTarget, mode: ControlMode },
+    SetPwmA {
+        on_time_us: u32,
+    },
+    SetPwmB {
+        on_time_us: u32,
+    },
+    SetConstant {
+        constant: Constants,
+        value: f32,
+    },
+    SendAlign {
+        angle: f32,
+        confidence: f32,
+    },
+    SetControlMode {
+        target: ControlTarget,
+        mode: ControlMode,
+    },
 }
 
 pub fn init_usb_serial(

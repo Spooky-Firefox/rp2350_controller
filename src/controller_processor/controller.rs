@@ -202,3 +202,119 @@ impl RlsAngleFilter {
         self.covariance = 1.0;
     }
 }
+
+/// Heading observer using bicycle-model predict and camera-aligned correct (scalar Kalman filter).
+///
+/// Predicts heading change from steering angle and encoder distance using the kinematic bicycle model:
+///   dθ = (ds / L) * tan(δ)  [rad]
+/// where ds is distance traveled [m], L is wheelbase [m], and δ is steering angle [rad].
+///
+/// Corrects predicted heading toward the camera-measured angle using a scalar Kalman-style update:
+///   innovation = z - θ_pred
+///   gain = P / (P + R)
+///   θ = θ_pred + gain * innovation
+///   P = (1 - gain) * P + Q
+#[derive(Clone, Copy, Debug)]
+pub struct HeadingObserver {
+    /// Estimated heading [deg]
+    pub heading_estimate_deg: f32,
+    /// Covariance (estimate uncertainty) [deg²]
+    pub covariance: f32,
+    /// Process noise (prediction uncertainty) [deg²]
+    pub process_noise: f32,
+    /// Measurement noise (camera angle uncertainty) [deg²]
+    pub measurement_noise: f32,
+}
+
+impl HeadingObserver {
+    /// Create a new observer with default tuning.
+    pub const fn new() -> Self {
+        Self {
+            heading_estimate_deg: 0.0,
+            covariance: 1.0,
+            process_noise: 0.01,  // Q: trust the bicycle model strongly
+            measurement_noise: 0.5, // R: camera angle is ~7 FPS, higher noise
+        }
+    }
+
+    /// Create observer with custom tuning parameters.
+    pub const fn with_params(process_noise: f32, measurement_noise: f32) -> Self {
+        Self {
+            heading_estimate_deg: 0.0,
+            covariance: 1.0,
+            process_noise,
+            measurement_noise,
+        }
+    }
+
+    /// Predict step: advance heading estimate using bicycle kinematics.
+    ///
+    /// # Arguments
+    /// - `distance_increment_m` — distance traveled since last prediction [m]
+    /// - `steering_pwm_us` — current steering command [microseconds]
+    /// - `wheelbase_m` — vehicle wheelbase [m]
+    /// - `steering_angle_per_us_deg` — steering angle sensitivity [deg/µs]
+    /// - `neutral_steering_pwm_us` — neutral steering PWM [µs]
+    ///
+    /// Updates `heading_estimate_deg` and increases covariance by `process_noise`.
+    pub fn predict(
+        &mut self,
+        distance_increment_m: f32,
+        steering_pwm_us: u16,
+        wheelbase_m: f32,
+        steering_angle_per_us_deg: f32,
+        neutral_steering_pwm_us: u16,
+    ) {
+        if distance_increment_m <= 0.0 || !wheelbase_m.is_finite() || wheelbase_m <= 0.0 {
+            // No motion or invalid wheelbase: covariance grows but heading is unchanged
+            self.covariance += self.process_noise;
+            return;
+        }
+
+        // Compute steering angle from PWM command
+        let pwm_error_us = (steering_pwm_us as i32) - (neutral_steering_pwm_us as i32);
+        let steering_angle_deg = (pwm_error_us as f32) * steering_angle_per_us_deg;
+        let steering_angle_rad = steering_angle_deg.to_radians();
+
+        // Bicycle model: dθ = (ds / L) * tan(δ)
+        // Use libm::tanf for no_std compatibility
+        let tan_delta = libm::tanf(steering_angle_rad);
+        let heading_change_rad = (distance_increment_m / wheelbase_m) * tan_delta;
+        let heading_change_deg = heading_change_rad.to_degrees();
+
+        // Update estimate and increase uncertainty
+        self.heading_estimate_deg += heading_change_deg;
+        self.covariance += self.process_noise;
+    }
+
+    /// Correct step: fuse camera-measured angle using scalar Kalman gain.
+    ///
+    /// Updates `heading_estimate_deg` toward the measured angle, weighted by current covariance
+    /// relative to measurement noise. Also decreases covariance.
+    pub fn correct(&mut self, measured_angle_deg: f32) {
+        if !measured_angle_deg.is_finite() {
+            // Invalid measurement: no update
+            return;
+        }
+
+        // Innovation
+        let innovation = measured_angle_deg - self.heading_estimate_deg;
+
+        // Kalman gain: K = P / (P + R)
+        let denominator = self.covariance + self.measurement_noise;
+        let kalman_gain = self.covariance / denominator;
+
+        // Update estimate
+        self.heading_estimate_deg += kalman_gain * innovation;
+
+        // Update covariance: P = (1 - K) * P
+        self.covariance = (1.0 - kalman_gain) * self.covariance;
+        self.covariance = self.covariance.max(0.01); // Prevent zero uncertainty
+    }
+
+    /// Reset observer state to initial values.
+    pub fn reset(&mut self) {
+        self.heading_estimate_deg = 0.0;
+        self.covariance = 1.0;
+    }
+}

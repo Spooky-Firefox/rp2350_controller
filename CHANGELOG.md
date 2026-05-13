@@ -2,7 +2,7 @@
 
 This file tracks notable repository changes.
 
-## Unreleased
+## spooky-firefox 2026-05-13
 
 ### Heading Observer (Bicycle Predict-Correct)
 
